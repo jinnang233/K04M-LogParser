@@ -1,6 +1,6 @@
 # K04M 日志解析器
 
-一个用于 Minecraft 服务端日志的 **Krypt04Mcg** 分片重组、二进制包结构查看与 JSON 导出工具。GUI 使用 Rust + egui，支持 `.log` 与 `.log.gz`。
+一个用于 Minecraft 服务端日志的 **Krypt04Mcg** 分片重组、二进制包结构查看、**私钥解密**与 JSON 导出工具。GUI 使用 Rust + egui，支持 `.log` 与 `.log.gz`。
 
 ![Rust](https://img.shields.io/badge/Rust-2024-000000?logo=rust)
 ![GUI](https://img.shields.io/badge/GUI-egui-1f6feb)
@@ -26,7 +26,14 @@
   - 可选按字段类别着色。
   - 自动滚动到被选字段。
 - 查看分片来源：文件、行号、时间、载荷长度、重复/缺失。
-- 一键导出**全部消息**为 JSON，包含字段树、字段偏移、分片来源、原始二进制（Base64URL 与十六进制）。
+- 加载一个或多个 Krypt04Mcg 私钥/账户，自动尝试解密包正文：
+  - 支持 `LocalKeyMaterial`（`keys/private/local.json`）、`sessions/*.json`、账户目录，以及包含多个账户的父目录。
+  - 自动读取账户 `secrets/master.key`（owner-only 与 Windows DPAPI 模式），解密 KMCGSEC1 加密的密钥与会话文件；私钥只在内存中使用，绝不会写入导出 JSON。
+  - KEM：`ML-KEM-512/768/1024`、BC 原生 `ML-KEM-768+X25519` 与 `ML-KEM-1024+X448` 复合 KEM，以及项目自定义 `K04-HYBRID-V1` 的 ML-KEM+X25519/X448 混合 KEM。
+  - AEAD：`AES-256-GCM`、`ChaCha20-Poly1305`；HKDF-SHA256；自动处理 `COMPRESSED` 标志的 raw DEFLATE。
+  - `SESSION_MESSAGE` 使用加载的会话密钥按 `sessionId` 解密；会话交换请求可用长期私钥解密，响应因使用一次性临时 KEM 公钥通常无法从日志解密。
+- 明文展示：UTF-8 文本直接显示，JSON 载荷格式化显示；可一键复制明文/JSON。
+- 一键导出**全部消息**为 JSON，包含字段树、字段偏移、分片来源、原始二进制（Base64URL 与十六进制）、解密状态与明文。
 
 ## 构建与运行
 
@@ -45,15 +52,30 @@ cargo build --release
 ./target/release/k04m-log-parser /path/to/logs/latest.log
 ```
 
-无界面导出 JSON：
+加载私钥并解密：
 
 ```bash
-./target/release/k04m-log-parser --export parsed.json /path/to/logs
+# 单个 LocalKeyMaterial 文件
+./target/release/k04m-log-parser --key /path/to/local.json /path/to/logs
+
+# 账户目录（含 keys/private/local.json、sessions/、secrets/master.key）
+./target/release/k04m-log-parser --key /path/to/config/krypt04mcg/accounts/<uuid> /path/to/logs
+
+# 包含多个账户的父目录；--key 可重复
+./target/release/k04m-log-parser --key /path/to/accounts --key /another/account /path/to/logs
+```
+
+无界面导出 JSON（同样支持 `--key`）：
+
+```bash
+./target/release/k04m-log-parser --key /path/to/account --export parsed.json /path/to/logs
 ```
 
 其他参数：
 
 ```text
+--key <路径>     加载私钥/会话密钥，可重复；支持 LocalKeyMaterial、
+                  sessions 文件/目录、账户目录或包含多个账户的父目录
 --export <路径>  解析后导出 JSON，不启动图形界面
 -h, --help      显示帮助
 -V, --version   显示版本
@@ -67,6 +89,7 @@ GUI 快捷方式：
 | `Ctrl+Shift+O` | 打开日志文件夹 |
 | `Ctrl+R` | 重新加载当前路径 |
 | `Ctrl+E` | 导出 JSON |
+| `Ctrl+K` | 打开私钥/会话密钥窗口 |
 
 也可以把文件或文件夹直接拖入窗口。
 
@@ -96,6 +119,48 @@ GUI 快捷方式：
 ### 分片来源
 
 展开“分片与来源”可以查看每个分片的所有出现位置，包括重复行。缺失索引会明确列出。
+
+### 解密结果
+
+选中一条已成功解析的消息后，头部下方会显示“解密结果”面板：
+
+- **已解密**：显示匹配的密钥所有者、算法、是否解压、明文长度。UTF-8 文本直接显示；JSON 载荷默认展开并格式化显示。右侧可复制明文或格式化 JSON。
+- **缺少密钥 / 不支持 / 解密失败**：显示原因，并可展开查看每个候选密钥的尝试结果；“加载私钥…”可直接打开密钥窗口。
+- 消息列表中的“明文”/“无密钥”标记以及“只看已解密”勾选项可快速筛选。
+
+密钥窗口（`Ctrl+K`）列出所有已加载的私钥与会话密钥，包括所有者、算法、指纹和来源文件，可单独移除或全部清空。私钥内容不会显示在界面上，也不会写入导出。
+
+## 解密包正文
+
+点击工具栏的 **密钥**（`Ctrl+K`）打开密钥窗口：
+
+- **加载私钥文件…**：可多选 `local.json`、`sessions/*.json` 或单个私钥记录 JSON。
+- **加载账户/密钥目录…**：选择 Krypt04Mcg 账户目录、`keys/`、`sessions/`，或包含多个 `accounts/<uuid>/` 的父目录。工具会递归发现这些账户。
+- 也可以把 `.json` 密钥文件或账户目录直接拖入窗口；日志文件仍按日志处理。
+- 加载后会自动重新解密当前所有消息；移除单个密钥、清空密钥同样会立即刷新结果。
+
+解密匹配规则：
+
+- **KEM 消息（类型 1/2/3）**：按包内 `receiver` 匹配私钥 `owner`，并优先使用 KEM 算法一致的私钥。私钥可以先于日志加载，也可以随时补充。
+- **会话消息（类型 4）**：按包内 `sessionId` 匹配已加载的会话密钥（来自 `sessions/*.json`）。会话消息与长期私钥无关。
+- **会话交换请求（类型 3，无 `SESSION_RESPONSE`）**：用接收方长期 KEM 私钥解密，可查看握手 JSON。
+- **会话交换响应（类型 3，带 `SESSION_RESPONSE`）**：加密到发起方的一次性临时 KEM 公钥，临时私钥只存在于内存中，日志通常无法解密。
+
+密钥文件格式：
+
+- 明文 `LocalKeyMaterial` JSON（含 `kemPrivateKey.keyData`）。
+- KMCGSEC1 加密文件（`KMCGSEC1` magic + 12 字节 nonce + AES-256-GCM 密文）。工具会在文件祖先目录中查找 `secrets/master.key`，并以账户根相对路径作为 AAD 解密。owner-only 主密钥（模式 2，Linux/macOS 默认）直接使用；Windows DPAPI（模式 1）在 Windows 上通过当前用户 DPAPI 解包，必须与创建 `master.key` 的 Windows 用户相同。在 Linux/macOS 上遇到模式 1 会给出明确错误，需要先导出明文 `LocalKeyMaterial` 或 owner-only 密钥。
+- `sessions/*.json` 的新版账本（含 `stateVersion`/`session`）和旧版单条 `SessionRecord` 都支持；待提交会话（`prepared.session`）也会加载并标注。也可以手工创建只含 `peer`、`sessionId`、`secret` 三个字段的 JSON 来导入单个会话密钥（`secret` 为 Base64URL 编码的 32 字节）。
+- 会话轮换会覆盖账户中的旧 `sessions/*.json`；如果旧会话密钥没有备份，对应历史消息只能显示“缺少密钥”。
+
+解密状态：
+
+- **已解密**：KEM 解封装（或会话密钥派生）和 AEAD 认证都成功；若 `COMPRESSED` 标志存在，已先做 raw DEFLATE 解压。合法 UTF-8 直接显示，非 UTF-8 明文以十六进制显示。
+- **缺少密钥**：没有 `owner` 或 `sessionId` 匹配的密钥；面板中可直接打开密钥窗口。
+- **不支持**：算法不在本工具实现范围内（例如 CMCE/HQC/NTRU/S-NTRU KEM、RSA/ECDH 复合 KEM），或遇到临时 KEM 响应。
+- **解密失败**：找到匹配密钥，但 KEM 解封装、AEAD 认证或解压失败。展开“已尝试的密钥”可查看每个候选的具体错误。
+
+> 解密成功只表示 **AEAD 标签验证通过**，即密文由持有该密钥的一方生成。本工具**不验证** PQ 签名，也不建立发送者身份信任、新鲜度或重放结论。日志会同时记录双向消息，因此加载多个玩家的私钥可以解密各自收到的包。
 
 ## 协议解析范围
 
@@ -141,10 +206,17 @@ i32  signatureLength + signature        (omitted for SESSION_MESSAGE)
 {
   "tool": "K04M 日志解析器",
   "version": "0.1.0",
-  "format_version": 1,
+  "format_version": 2,
   "exported_at_utc": "...",
   "cryptographic_verification": false,
-  "payload_decrypted": false,
+  "payload_decrypted": true,
+  "decryption_summary": {
+    "decrypted_messages": 3,
+    "no_matching_key": 8,
+    "unsupported_messages": 1,
+    "failed_messages": 0,
+    "not_attempted": 1
+  },
   "summary": {
     "source_files": 7,
     "fragment_lines": 259,
@@ -165,7 +237,10 @@ i32  signatureLength + signature        (omitted for SESSION_MESSAGE)
 - `fragment_total`、`unique_fragments`、`occurrence_count`、`duplicate_count`、`conflicts`、`missing_indices`
 - `binary_length`、`binary_base64url`、`binary_hex`（完整重组二进制）
 - `packet`：解析后的结构字段、算法、时间戳、session 信息、`fields` 字段树
+- `decryption`：解密状态、匹配的密钥所有者/来源/算法、`key_kind`（`private_key` 或 `session_secret`）、是否解压、明文字节长度、`plaintext`（合法 UTF-8 时）、`json`（明文为 JSON 对象/数组时）、`plaintext_hex`、`plaintext_base64url`、错误信息与全部候选密钥尝试
 - `fragments`：每个物理分片所在文件、行号、时间和载荷
+
+导出**不包含任何私钥或会话密钥材料**；只包含解密结果和密钥所有者/来源等来源信息。
 
 字段树中的每个 `DataField` 都含 `offset` 与 `length`，可直接用于定位原始字节：
 
@@ -183,10 +258,14 @@ i32  signatureLength + signature        (omitted for SESSION_MESSAGE)
 
 ## 重要限制
 
-- 日志里只有**加密后的包**。没有会话密钥或长期私钥时，无法解密聊天正文；本工具不尝试伪造解密结果。
-- 不执行签名验证、AEAD 认证、会话重放检查或 TOFU 信任判断。它只读取日志中可见的协议结构。
+- 日志里只有**加密后的包**。没有匹配的长期私钥（KEM 消息）或会话密钥（`SESSION_MESSAGE`）时，只能查看结构，本工具不会伪造解密结果。
+- KEM 支持范围：`ML-KEM-512/768/1024`、BC 原生 `ML-KEM-768+X25519` / `ML-KEM-1024+X448` 复合 KEM，以及 `K04-HYBRID-V1` 的 ML-KEM+X25519/X448 混合 KEM。其他 KEM（CMCE、HQC、NTRU、S-NTRU、RSA/ECDH 复合等）会显示为“不支持”。
+- AEAD 支持 `AES-256-GCM` 与 `ChaCha20-Poly1305`。流通道使用的 XChaCha20-Poly1305 不在此工具的数据包解密范围内。
+- 会话交换响应使用一次性临时 KEM 公钥加密，临时私钥不落盘，通常无法从日志解密；会话消息需要账户 `sessions/` 中的会话密钥。
+- Windows DPAPI 主密钥绑定创建它的 Windows 用户配置文件；换用户、换机器或复制到 Linux/macOS 后无法解包（除非有漫游配置文件或 DPAPI 备份密钥）。
+- **不执行签名验证**、发送者信任、新鲜度或重放检查。AEAD 认证成功不等于发送者身份可信。
 - 包时间戳是发送方声明值，未经过本工具认证；日志行时间来自服务器日志。
-- 混合 KEM 封装和混合签名内部由 Bouncy Castle 复合格式定义，本工具只展示整体字节范围。
+- 混合 KEM 封装和混合签名内部由 Bouncy Castle 复合格式定义，本工具只展示整体字节范围（解密封装除外）。
 - 超大日志会一次性读入内存并同步解析；当前目标场景是 Minecraft `logs/` 目录（通常几十 MB 以内）。
 
 ## GitHub Actions
@@ -200,8 +279,9 @@ i32  signatureLength + signature        (omitted for SESSION_MESSAGE)
 流程：
 
 1. **Check**：在 Ubuntu 上安装 Linux GUI 构建依赖，执行 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --locked`。
-2. **Release build**：测试通过后，在 Linux、Windows、macOS 上分别执行 `cargo build --release --locked`。
-3. **Artifacts**：将三平台 release 二进制上传到本次 Actions 运行页面，保留 14 天。artifact 名称格式为 `k04m-log-parser-<OS>-<ARCH>`。
+2. **Windows DPAPI**：在 `windows-latest` 上运行 `dpapi_protected_master_key_and_kmcg_round_trip`，验证 DPAPI 主密钥解包与 KMCGSEC1 路径 AAD。
+3. **Release build**：测试通过后，在 Linux、Windows、macOS 上分别执行 `cargo build --release --locked`。
+4. **Artifacts**：将三平台 release 二进制上传到本次 Actions 运行页面，保留 14 天。artifact 名称格式为 `k04m-log-parser-<OS>-<ARCH>`。
 
 无需在仓库中配置任何 secrets；`Cargo.lock` 已锁定依赖版本。发布 job 已在工作流中显式申请 `contents: write`，用于创建 GitHub Release。
 
@@ -250,9 +330,35 @@ cargo clippy --all-targets -- -D warnings
 | `src/fragment.rs` | 分片行识别、分组、重组、冲突检测 |
 | `src/log_reader.rs` | 文件/目录发现、gzip、逐行扫描、日期推断 |
 | `src/packet.rs` | v1–v4 二进制包结构解析、字段偏移与字段树 |
+| `src/decrypt.rs` | 私钥/会话密钥加载、KMCGSEC1、KEM 解封装、AAD 重建、AEAD 解密 |
 | `src/export.rs` | 完整 JSON 导出 |
-| `src/app.rs` | egui 界面、消息列表、字段/十六进制联动 |
+| `src/app.rs` | egui 界面、消息列表、字段/十六进制联动、密钥与明文面板 |
 | `src/model.rs` | 数据模型 |
+
+### 解密测试向量
+
+`tests/data/decryption-vectors.json` 由 Krypt04Mcg 的 Bouncy Castle 实现实际生成；其中的私钥均为一次性测试密钥，请勿用于真实流量。覆盖：
+
+- ML-KEM-768+X25519 原生复合 KEM（AES-GCM / ChaCha20-Poly1305，压缩/未压缩）
+- ML-KEM-1024+X448 原生复合 KEM
+- 自定义 `K04-HYBRID-V1` ML-KEM-512+X25519 / ML-KEM-1024+X25519 / ML-KEM-512+X448
+- 裸 ML-KEM-768
+- SESSION_MESSAGE 会话密钥
+- SESSION_EXCHANGE 请求
+- KMCGSEC1 加密账户目录（`secrets/master.key` + `keys/private/local.json` + `sessions/`）
+- Windows-only 测试：在 Windows CI 上用 `CryptProtectData` 生成 mode-1 主密钥，验证 DPAPI 解包与 KMCGSEC1 路径 AAD 的完整链路；Linux/macOS 构建不包含该分支
+
+重新生成（需要先构建 Krypt04Mcg，并准备 BC 1.86 与 Gson jar）：
+
+```bash
+BC_JAR=/path/to/Krypt04Mcg/build/processIncludeJars/bcprov-jdk18on-1.86.jar
+GSON_JAR=$(find ~/.gradle/caches -name 'gson-2.14.0.jar' | head -1)
+KRYPT_CLASSES=/path/to/Krypt04Mcg/build/classes/java/main
+javac -cp "$KRYPT_CLASSES:$BC_JAR:$GSON_JAR" -d /tmp/k04m-vectors \
+    tools/generate_decryption_vectors.java
+java -cp "/tmp/k04m-vectors:$KRYPT_CLASSES:$BC_JAR:$GSON_JAR" \
+    GenVectors > tests/data/decryption-vectors.json
+```
 
 ## 许可
 

@@ -11,9 +11,9 @@ use crate::model::{Algorithms, DataField, ParsedPacket};
 pub const MAX_PACKET_BYTES: usize = 256 * 1024;
 const MAX_STRING_BYTES: usize = 4096;
 const MAX_FIELD_BYTES: usize = 1024 * 1024;
-const FLAG_SIGNED: u8 = 0x01;
-const FLAG_COMPRESSED: u8 = 0x02;
-const FLAG_SESSION_RESPONSE: u8 = 0x04;
+pub const FLAG_SIGNED: u8 = 0x01;
+pub const FLAG_COMPRESSED: u8 = 0x02;
+pub const FLAG_SESSION_RESPONSE: u8 = 0x04;
 const KNOWN_FLAGS: u8 = FLAG_SIGNED | FLAG_COMPRESSED | FLAG_SESSION_RESPONSE;
 
 // Palette categories shared with the hex view.
@@ -437,6 +437,7 @@ fn parse_inner(data: &[u8], packet: &mut ParsedPacket) -> ParseResult<usize> {
     } else if version < 3 {
         let fragment_start = cursor.pos;
         let index = cursor.u16()?;
+        packet.aad_fragment_index = Some(index);
         packet.fields.push(DataField {
             name: "aad_fragment_index".to_owned(),
             label: "AAD 分片索引（旧版）".to_owned(),
@@ -450,6 +451,7 @@ fn parse_inner(data: &[u8], packet: &mut ParsedPacket) -> ParseResult<usize> {
         });
         let total_offset = cursor.pos;
         let total = cursor.u16()?;
+        packet.aad_fragment_total = Some(total);
         packet.fields.push(DataField {
             name: "aad_fragment_total".to_owned(),
             label: "AAD 分片总数（旧版）".to_owned(),
@@ -568,6 +570,7 @@ fn parse_inner(data: &[u8], packet: &mut ParsedPacket) -> ParseResult<usize> {
 
     let (nonce_start, nonce_total, nonce_data_start, nonce_len) = cursor.bytes16()?;
     packet.nonce_len = nonce_len;
+    packet.nonce_data_offset = nonce_data_start;
     packet.fields.push(byte_field(
         "nonce",
         "Nonce",
@@ -584,6 +587,7 @@ fn parse_inner(data: &[u8], packet: &mut ParsedPacket) -> ParseResult<usize> {
 
     let (kem_start, kem_total, kem_data_start, kem_len) = cursor.bytes32()?;
     packet.kem_ciphertext_len = kem_len;
+    packet.kem_ciphertext_data_offset = kem_data_start;
     let kem_note = if kem_len == 0 {
         Some("会话消息不携带 KEM 封装".to_owned())
     } else if packet.algorithms.kem.contains('+') {
@@ -608,6 +612,7 @@ fn parse_inner(data: &[u8], packet: &mut ParsedPacket) -> ParseResult<usize> {
 
     let (cipher_start, cipher_total, cipher_data_start, cipher_len) = cursor.bytes32()?;
     packet.ciphertext_len = cipher_len;
+    packet.ciphertext_data_offset = cipher_data_start;
     let uses_aead_tag = has_aead_tag(&packet.algorithms.aead) && cipher_len >= 16;
     let mut cipher_children = vec![length_field(
         "ciphertext.length",
@@ -678,6 +683,7 @@ fn parse_inner(data: &[u8], packet: &mut ParsedPacket) -> ParseResult<usize> {
         let (signature_start, signature_total, signature_data_start, signature_len) =
             cursor.bytes32()?;
         packet.signature_len = signature_len;
+        packet.signature_data_offset = signature_data_start;
         let signature_note = if signature_len == 0 {
             if signed {
                 Some("SIGNED 标志已设置，但签名为空".to_owned())

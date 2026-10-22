@@ -1,19 +1,33 @@
 [package]
 name = "k04m-log-parser"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Krypt04Mcg Minecraft log fragment reassembler, binary packet viewer, and JSON exporter"
+description = "Krypt04Mcg Minecraft log fragment reassembler, packet viewer, private-key decryptor, and JSON exporter"
 license = "Unlicense"
 
 [dependencies]
+aes-gcm = "0.11"
 base64 = "0.22"
+chacha20poly1305 = "0.11"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 eframe = { version = "0.32.3", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 flate2 = "1"
+hkdf = "0.13"
+ml-kem = "0.3"
 rfd = { version = "0.15.4", default-features = false, features = ["xdg-portal", "async-std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11"
+sha3 = "0.12"
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+x448 = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
 
 [profile.release]
 lto = "thin"

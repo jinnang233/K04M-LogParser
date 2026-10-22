@@ -9,8 +9,8 @@ use chrono::{Local, Utc};
 use serde::Serialize;
 
 use crate::model::{
-    FragmentGroup, FragmentOccurrence, LoadedLogs, LogTimestamp, MessageStatus, ParsedPacket,
-    SourceInfo,
+    DecryptionOutcome, DecryptionStatus, FragmentGroup, FragmentOccurrence, LoadedLogs,
+    LogTimestamp, MessageStatus, ParsedPacket, SourceInfo,
 };
 use crate::packet::hex;
 
@@ -21,13 +21,24 @@ struct ExportDocument<'a> {
     format_version: u32,
     exported_at_utc: String,
     exported_at_local: String,
-    /// Parsing is structural only; no signature/AEAD/trust validation is done.
+    /// Signatures are not verified; successful AEAD decryption authenticates
+    /// the ciphertext under a loaded key but not the claimed sender identity.
     cryptographic_verification: bool,
-    /// Chat-log ciphertext cannot be decrypted without session/private keys.
+    /// True when at least one packet was authenticated and decrypted.
     payload_decrypted: bool,
+    decryption_summary: DecryptionSummary,
     summary: ExportSummary,
     sources: Vec<&'a SourceInfo>,
     messages: Vec<ExportMessage<'a>>,
+}
+
+#[derive(Serialize)]
+struct DecryptionSummary {
+    decrypted_messages: usize,
+    no_matching_key: usize,
+    unsupported_messages: usize,
+    failed_messages: usize,
+    not_attempted: usize,
 }
 
 #[derive(Serialize)]
@@ -63,6 +74,9 @@ struct ExportMessage<'a> {
     binary_hex: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     packet: Option<&'a ParsedPacket>,
+    /// Authenticated plaintext and key provenance, when decryption was attempted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decryption: Option<&'a DecryptionOutcome>,
     fragments: Vec<&'a FragmentOccurrence>,
 }
 
@@ -97,14 +111,27 @@ fn build_document(loaded: &LoadedLogs) -> ExportDocument<'_> {
         .iter()
         .map(build_message)
         .collect::<Vec<_>>();
+    let decryption_summary = DecryptionSummary {
+        decrypted_messages: count_status(loaded, DecryptionStatus::Decrypted),
+        no_matching_key: count_status(loaded, DecryptionStatus::NoKey),
+        unsupported_messages: count_status(loaded, DecryptionStatus::Unsupported),
+        failed_messages: count_status(loaded, DecryptionStatus::Failed),
+        not_attempted: loaded
+            .messages
+            .iter()
+            .filter(|message| message.decryption.is_none())
+            .count()
+            + count_status(loaded, DecryptionStatus::NotAttempted),
+    };
     ExportDocument {
         tool: "K04M 日志解析器",
         version: env!("CARGO_PKG_VERSION"),
-        format_version: 1,
+        format_version: 2,
         exported_at_utc: now_utc.to_rfc3339(),
         exported_at_local: now_utc.with_timezone(&Local).to_rfc3339(),
         cryptographic_verification: false,
-        payload_decrypted: false,
+        payload_decrypted: decryption_summary.decrypted_messages > 0,
+        decryption_summary,
         summary: ExportSummary {
             source_files: loaded.sources.len(),
             fragment_lines: loaded.fragment_lines,
@@ -139,8 +166,22 @@ fn build_message<'a>(message: &'a FragmentGroup) -> ExportMessage<'a> {
             .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)),
         binary_hex: binary.map(hex),
         packet: message.packet.as_ref(),
+        decryption: message.decryption.as_ref(),
         fragments: message.all_occurrences_sorted(),
     }
+}
+
+fn count_status(loaded: &LoadedLogs, status: DecryptionStatus) -> usize {
+    loaded
+        .messages
+        .iter()
+        .filter(|message| {
+            message
+                .decryption
+                .as_ref()
+                .is_some_and(|outcome| outcome.status == status)
+        })
+        .count()
 }
 
 #[cfg(test)]

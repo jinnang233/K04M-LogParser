@@ -46,6 +46,114 @@ pub struct FragmentSlot {
     pub occurrences: Vec<FragmentOccurrence>,
 }
 
+/// Outcome of trying to decrypt one reassembled packet with the loaded key
+/// material. Decryption never verifies signatures or establishes sender trust;
+/// a successful AEAD tag check only proves that the ciphertext was produced by
+/// a holder of the matched key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecryptionStatus {
+    /// No decryption was attempted (incomplete or structurally invalid packet).
+    #[default]
+    NotAttempted,
+    /// AEAD authentication and plaintext decoding succeeded.
+    Decrypted,
+    /// The packet is structurally readable, but no matching private key or
+    /// session secret was loaded.
+    NoKey,
+    /// The algorithm or packet layout cannot be decrypted by this tool.
+    Unsupported,
+    /// A matching key was found, but KEM/AEAD/decompression failed.
+    Failed,
+}
+
+impl DecryptionStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotAttempted => "未尝试",
+            Self::Decrypted => "已解密",
+            Self::NoKey => "缺少密钥",
+            Self::Unsupported => "不支持",
+            Self::Failed => "解密失败",
+        }
+    }
+
+    pub fn color(self) -> Color32 {
+        match self {
+            Self::Decrypted => Color32::from_rgb(88, 201, 135),
+            Self::NoKey => Color32::from_rgb(238, 181, 74),
+            Self::Unsupported => Color32::from_rgb(200, 160, 255),
+            Self::Failed => Color32::from_rgb(235, 104, 104),
+            Self::NotAttempted => Color32::from_rgb(140, 150, 165),
+        }
+    }
+
+    pub fn is_decrypted(self) -> bool {
+        self == Self::Decrypted
+    }
+}
+
+/// One key or session-secret candidate that was tried for a packet.
+#[derive(Clone, Debug, Serialize)]
+pub struct DecryptionAttempt {
+    pub key_owner: String,
+    pub key_source: String,
+    /// `private_key` or `session_secret`.
+    pub key_kind: String,
+    pub algorithm: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Decrypted packet contents plus provenance for the key that opened it.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DecryptionOutcome {
+    pub status: DecryptionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_algorithm: Option<String>,
+    /// `private_key` for KEM packets, `session_secret` for session messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Whether the authenticated plaintext was raw-DEFLATE compressed.
+    pub compressed: bool,
+    pub plaintext_length: usize,
+    /// Strictly decoded UTF-8 text, when the plaintext is valid UTF-8.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plaintext: Option<String>,
+    /// Pretty-printed JSON interpretation when the plaintext is a JSON object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plaintext_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plaintext_base64url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub attempts: Vec<DecryptionAttempt>,
+    /// Raw authenticated plaintext bytes, kept for rendering/copying but never
+    /// serialized as an array of numbers.
+    #[serde(skip)]
+    pub plaintext_bytes: Vec<u8>,
+}
+
+impl DecryptionOutcome {
+    pub fn is_decrypted(&self) -> bool {
+        self.status == DecryptionStatus::Decrypted
+    }
+
+    pub fn display_text(&self) -> Option<&str> {
+        self.plaintext.as_deref()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageStatus {
@@ -96,6 +204,9 @@ pub struct FragmentGroup {
     /// exist. A parse error is reflected in `ParsedPacket::error`.
     pub packet: Option<ParsedPacket>,
     pub status: MessageStatus,
+    /// Populated after key material is loaded; `None` means decryption has not
+    /// been attempted for this group yet.
+    pub decryption: Option<DecryptionOutcome>,
 }
 
 impl FragmentGroup {
@@ -255,11 +366,22 @@ pub struct ParsedPacket {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<i64>,
+    /// Legacy v1/v2 AAD fragment metadata, needed to rebuild the AEAD AAD.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aad_fragment_index: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aad_fragment_total: Option<u16>,
     pub algorithms: Algorithms,
     pub nonce_len: usize,
     pub kem_ciphertext_len: usize,
     pub ciphertext_len: usize,
     pub signature_len: usize,
+    /// Offsets of the variable-length payload bytes inside the reassembled
+    /// packet, used to feed KEM/AEAD without re-parsing the field tree.
+    pub nonce_data_offset: usize,
+    pub kem_ciphertext_data_offset: usize,
+    pub ciphertext_data_offset: usize,
+    pub signature_data_offset: usize,
     /// Byte offset where parsing stopped.
     pub consumed: usize,
     /// Number of bytes after the parsed envelope.
