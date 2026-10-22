@@ -1,0 +1,236 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
+          fetch-depth: 0
+
+      - name: Verify tag and crate version
+        run: |
+          set -euo pipefail
+
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *)
+              echo "::error::Release tag must start with 'v': $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$version" ]; then
+            echo "::error::Could not read the package version from Cargo.toml"
+            exit 1
+          fi
+
+          if [ "$RELEASE_TAG" != "v$version" ]; then
+            echo "::error::Tag $RELEASE_TAG does not match Cargo.toml version $version (expected v$version)"
+            exit 1
+          fi
+
+          git fetch --tags --force --quiet origin
+          if ! git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG^{commit}" >/dev/null; then
+            echo "::error::Tag $RELEASE_TAG does not exist in the repository"
+            exit 1
+          fi
+
+          echo "Releasing $RELEASE_TAG (Cargo.toml version $version)"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+  build:
+    name: Build ${{ matrix.os }} package
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: windows-latest
+          - os: macos-latest
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package release archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${RELEASE_TAG#v}"
+          name="k04m-log-parser-${version}-${RUNNER_OS}-${RUNNER_ARCH}"
+
+          rm -rf dist
+          mkdir -p dist/stage
+          cp target/release/k04m-log-parser dist/stage/
+          cp README.md LICENSE dist/stage/
+          chmod +x dist/stage/k04m-log-parser
+          tar -czf "dist/${name}.tar.gz" -C dist/stage .
+          rm -rf dist/stage
+
+          ls -lh dist
+
+      - name: Package release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $version = $env:RELEASE_TAG.Substring(1)
+          $name = "k04m-log-parser-$version-$env:RUNNER_OS-$env:RUNNER_ARCH"
+
+          Remove-Item dist -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path dist/stage -Force | Out-Null
+          Copy-Item target/release/k04m-log-parser.exe dist/stage/
+          Copy-Item README.md, LICENSE dist/stage/
+          Compress-Archive -Path dist/stage/* -DestinationPath "dist/$name.zip" -Force
+          Remove-Item dist/stage -Recurse -Force
+
+          Get-ChildItem dist
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ runner.os }}-${{ runner.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download release packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          find dist -maxdepth 1 -type f -printf '%f\n' | sort
+          test -n "$(find dist -maxdepth 1 -type f -name 'k04m-log-parser-*' -print -quit)"
+
+          (
+            cd dist
+            sha256sum k04m-log-parser-* > SHA256SUMS.txt
+          )
+          ls -lh dist
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; replacing assets"
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            args=(--title "$RELEASE_TAG" --generate-notes --verify-tag)
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              args+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" "${args[@]}" dist/*
+          fi
+
+          {
+            echo "### Published release $RELEASE_TAG"
+            echo
+            gh release view "$RELEASE_TAG" --json url -q .url
+          } >> "$GITHUB_STEP_SUMMARY"
