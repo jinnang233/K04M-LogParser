@@ -927,7 +927,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
 
 fn hkdf_sha256(ikm: &[u8], salt: Option<&[u8]>, info: &[u8]) -> Result<[u8; 32], String> {
     let hkdf = Hkdf::<Sha256>::new(salt, ikm);
-    let mut output = [0u8; 32];
+    let mut output: [u8; 32] = Default::default();
     hkdf.expand(info, &mut output)
         .map_err(|_| "HKDF-SHA256 扩展失败".to_owned())?;
     Ok(output)
