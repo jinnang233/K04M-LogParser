@@ -1,6 +1,6 @@
 # K04M 日志解析器
 
-一个用于 Minecraft 服务端日志的 **Krypt04Mcg** 分片重组、二进制包结构查看、**私钥解密**与 JSON 导出工具。GUI 使用 Rust + egui，支持 `.log` 与 `.log.gz`。
+一个用于 Minecraft 服务端日志与抓包的 **Krypt04Mcg** 分片重组、二进制包结构查看、**私钥解密**、**签名验证**与 JSON 导出工具。GUI 使用 Rust + egui，支持 `.log`、`.log.gz`、`.pcap` 与 `.pcapng`。
 
 ![Rust](https://img.shields.io/badge/Rust-2024-000000?logo=rust)
 ![GUI](https://img.shields.io/badge/GUI-egui-1f6feb)
@@ -45,10 +45,21 @@
   - `SESSION_MESSAGE` 使用加载的会话密钥按 `sessionId` 解密；会话交换请求可用长期私钥解密，响应因使用一次性临时 KEM 公钥通常无法从日志解密。
 - 明文展示：UTF-8 文本直接显示，JSON 载荷格式化显示；可一键复制明文/JSON。
 - 一键导出**全部消息**为 JSON，包含字段树、字段偏移、分片来源、原始二进制（Base64URL 与十六进制）、解密状态与明文。
+- **签名验证**：使用加载的签名公钥验证包信封的 `signature` 字段，日志与抓包共用同一套匹配规则。
+  - 支持 ML-DSA-44/65/87、SLH-DSA 全部 FIPS 205 参数集、项目的 `K04-HYBRID-SIGNATURE-V1` 自定义混合签名（PQ 分量为 ML-DSA/SLH-DSA，经典分量为 Ed25519/Ed448），以及 Bouncy Castle 原生复合签名 `MLDSA44-Ed25519-SHA512`、`MLDSA65-Ed25519-SHA512`、`MLDSA87-Ed448-SHAKE256`。
+  - 公钥来源：账户 `keys/public/*.json`、`local.json` 的 `signaturePublicKey`、以及抓包 `krypt04mcg:public_key` 通道中的公钥共享。
+  - 验签结果与解密相互独立，分别显示“签名有效 / 缺少公钥 / 不支持 / 签名无效”。
+  - 其它签名算法（Falcon、SQIsign、SNOVA、MAYO、UOV、RSA/ECDSA 复合等）显示为“不支持”，不会误判为有效。
+- **PCAP/PCAPNG 抓包分析**：使用 `tcpstreams` 重组 TCP、`mc_protocol` 解析 Minecraft 帧、`minecraft_data` 提供 Minecraft 26.3（协议 777）数据包 ID，提取并解析 Krypt04Mcg 的全部通道：
+  - `krypt04mcg:chat_fragment`：加密聊天分片，跨两个方向合并重组并按 `PacketCodec` 解析/解密。
+  - `krypt04mcg:public_key`：公钥 KeyShare 分片（`uuid:index:total:data`）重组为身份 JSON。
+  - `krypt04mcg_stream:control`：流分配、会话交换、READY/END/RESET/ABORT，校验 HMAC-SHA256。
+  - `krypt04mcg_stream:data/0` … `data/255`：按流方向派生 XChaCha20-Poly1305 密钥，逐条认证解密并重组业务字节流。
+  - `krypt04mcg:tunnel`：旧版隧道信封结构解析。
 
 ## 构建与运行
 
-需要稳定版 Rust（1.88+）：
+需要稳定版 Rust（1.89+）：
 
 ```bash
 cargo test
@@ -82,11 +93,35 @@ cargo build --release
 ./target/release/k04m-log-parser --key /path/to/account --export parsed.json /path/to/logs
 ```
 
+打开或分析 pcap/pcapng 抓包：
+
+```bash
+# 直接打开 GUI
+./target/release/k04m-log-parser --key /path/to/account capture.pcapng
+
+# GUI 中也可以“打开文件/文件夹”或把 .pcap/.pcapng 拖入窗口
+# 命令行分析并导出 JSON
+./target/release/k04m-log-parser --key /path/to/account --export capture.json capture.pcapng
+
+# 也可以显式使用 --pcap，并可重复
+./target/release/k04m-log-parser --pcap capture.pcapng --export capture.json
+
+# 提取所有已解密的 API 流方向到目录
+./target/release/k04m-log-parser --pcap capture.pcapng \
+    --key /path/to/account --extract-streams extracted-streams
+```
+
 其他参数：
 
 ```text
---key <路径>     加载私钥/会话密钥，可重复；支持 LocalKeyMaterial、
-                  sessions 文件/目录、账户目录或包含多个账户的父目录
+--key <路径>     加载私钥/会话密钥/签名公钥，可重复；支持 LocalKeyMaterial、
+                  sessions、stream-api/sessions、keys/public、账户目录或
+                  包含多个账户的父目录
+--pcap <路径>    打开 pcap/pcapng 抓包，可重复；位置参数中的 .pcap/.pcapng
+                  也会自动识别。与 --export/--extract-streams 同用时只做
+                  命令行分析，否则启动图形界面
+--extract-streams <目录>
+                  把已解密的 API 流方向写入目录
 --export <路径>  解析后导出 JSON，不启动图形界面
 -h, --help      显示帮助
 -V, --version   显示版本
@@ -96,25 +131,79 @@ GUI 快捷方式：
 
 | 快捷键 | 功能 |
 | --- | --- |
-| `Ctrl+O` | 打开日志文件 |
-| `Ctrl+Shift+O` | 打开日志文件夹 |
+| `Ctrl+O` | 打开日志或抓包文件 |
+| `Ctrl+Shift+O` | 打开文件夹（递归发现日志与抓包） |
 | `Ctrl+R` | 重新加载当前路径 |
-| `Ctrl+E` | 导出 JSON |
-| `Ctrl+K` | 打开私钥/会话密钥窗口 |
+| `Ctrl+E` | 导出 JSON（日志或抓包） |
+| `Ctrl+K` | 打开私钥/会话密钥/签名公钥窗口 |
 
 也可以把文件或文件夹直接拖入窗口。
+
+## PCAP/PCAPNG 抓包分析
+
+GUI 与命令行都支持抓包分析。它从 pcap/pcapng 中重组 TCP 会话，解析 Minecraft 26.3 / 协议 777 的握手、登录、配置与 Play 阶段，并提取 Krypt04Mcg 通道。GUI 主消息列表会按抓包时间混合显示聊天消息、流控制消息、公钥共享和每个 API 流方向；选中任意一条即可查看其字段树与二进制（API 流方向会自动保留解密后的完整字节）。连接、流概览与原始通道事件仍可在“抓包详情”窗口中查看。
+
+### 支持的通道
+
+| 通道 | 方向 | 解析内容 |
+| --- | --- | --- |
+| `krypt04mcg:chat_fragment` | C2S/S2C | `peer`、`fragment`、`version`；分片文本按 `[KRYPT04MCG] <id> <index> <total> <payload>` 重组 |
+| `krypt04mcg:public_key` | C2S/S2C | 公钥身份分片；按 `uuid:index:total:data` 重组并解析身份 JSON |
+| `krypt04mcg_stream:control` | C2S/S2C | `EXCHANGE`、`OPEN`、`ASSIGNED`、`READY`、`END`、`RESET`、`ABORT`；HMAC-SHA256 校验 |
+| `krypt04mcg_stream:data/0` … `data/255` | C2S/S2C | XChaCha20-Poly1305 记录；按槽位绑定、方向密钥与隐式计数器解密 |
+| `krypt04mcg:tunnel` | C2S/S2C | `peer` + 信封（流 UUID、lease、内层 Krypt04Mcg 包） |
+
+Minecraft 帧解析完全交给 `mc_protocol`（VarInt、字符串、压缩帧），数据包 ID 来自 `minecraft_data` 的 26.3 数据，而不是在本项目中硬编码。
+
+### API 流与业务通道
+
+`krypt04mcg_stream:control` 的 `OPEN`/`ASSIGNED`/`READY` 会把一个流绑定到客户端的某个 `data/N` 槽位。槽位在本地半关闭后仍会保留到对端 `END`，因此单向关闭之后仍在途的数据也能解密。每条流记录使用：
+
+- HKDF-SHA256：`IKM = stream-api 会话 secret`，`salt = sessionId`，`info = krypt04mcg_stream/v1/data/<sessionId>/<streamUuid>/<slot>/<channel>/<source>/<target>`
+- XChaCha20-Poly1305：`nonce = streamUuid(16B) || counter(8B BE)`，`AAD = krypt04mcg_stream/v1/<sessionId>/<streamUuid>/<slot>/<channel>`
+- 每个方向独立从 0 开始计数；认证失败后停止该方向的后续解密并报告。
+
+业务通道是应用自定义的不透明字节流。内置文件共享使用 `krypt04mcg_file:stream`（Java `writeUTF(name)` + `writeInt(size)` + 文件内容）；其他通道按 UTF-8/JSON/二进制自动识别，并计算 SHA-256。`--extract-streams` 会写出每个已解密流方向的完整字节。
+
+### 密钥来源
+
+- 聊天包/会话交换：`<account>/keys/private/local.json` 与 `<account>/sessions/*.json`。
+- 原始加密流：`<account>/stream-api/sessions/*.json`（使用 `<account>/stream-api/secrets/master.key` 解密）。
+- `--key` 指向账户目录时会同时加载这两套会话；也可以直接指向 `stream-api` 目录。
+
+### 输出
+
+`--export capture.json` 生成：
+
+- `summary`：抓包、TCP 会话、Minecraft 连接、通道消息、聊天重组、公钥共享、API 流、流记录与明文字节统计。
+- `connections`：每个 Minecraft 连接的玩家、协议版本、brand、压缩阈值、已注册通道。
+- `events`：`chat_fragment`、`public_key`、`control`、`tunnel` 以及无法绑定/识别的通道消息，含时间、方向、连接、帧偏移和解析结果。
+- `chat_transfers`：跨两个方向合并后的加密聊天消息、分片来源、`PacketCodec` 字段树与解密结果。
+- `public_key_shares`：公钥 KeyShare 重组状态与身份摘要。
+- `api_streams`：按流 UUID 合并的 API 流；每个方向包含记录索引、密文/明文长度、解密状态、内容类型、SHA-256、预览/JSON/Base64。完整解密字节只在内存中保留（`CaptureOptions::retain_stream_data`；GUI 为查看二进制会启用该选项，CLI 默认关闭），可由 `--extract-streams` 写出，不写入 JSON。
+- `warnings`：协议版本不匹配、HMAC 失败、缺失记录、未绑定槽位等。
+
+### 限制
+
+- 只支持未启用 Minecraft 协议加密（online-mode 的 AES 流）的抓包；本工具不实现 Minecraft 的登录加密。
+- 需要抓包包含 Minecraft 握手/登录阶段，才能可靠确定协议状态、压缩阈值与玩家名；从中途开始的抓包可能只能提取服务端通道消息。
+- `tcpstreams` 按四元组合并会话；同一抓包中复用相同端口的多条连接会被视为同一会话。IP 分片会被跳过。
+- 流记录没有显式序号；抓包丢失或乱序会导致该方向后续记录认证失败。
+- 验签需要对应发送者的签名公钥。抓包只会自动登记 `owner` 与公钥共享发送者一致的完整身份；缺失时可手动加载 `keys/public/*.json`。
+- 签名算法支持范围见上文；不在范围内的算法显示“不支持”，不会被当作验证通过。
+- 协议版本以 Minecraft 26.3（777）的数据包 ID 表为准；其他版本会给出警告，但可能无法正确识别数据包。
 
 ## 界面说明
 
 ### 消息列表
 
-每条**消息 ID + 传输发送者**组合为一个重组单元。一条消息可能由多个分片组成，也可能来自多个日志文件。状态含义：
+日志模式下，每条**消息 ID + 传输发送者**组合为一个重组单元；一条消息可能由多个分片组成，也可能来自多个日志文件。抓包模式下，列表按时间混合显示聊天消息、`krypt04mcg_stream:control` 控制消息、`krypt04mcg:public_key` 公钥共享，以及每个 API 流方向，并可在右侧查看对应的字段树与二进制。状态含义：
 
-- **已解析**：所有分片齐全、Base64URL 解码成功、包结构解析成功。
-- **不完整**：缺少部分分片，无法生成完整二进制。
-- **错误**：分片总数冲突、Base64URL 解码失败、包结构错误、尾随字节、同索引载荷冲突等。
+- **已解析**：所有分片齐全、Base64URL 解码成功、包结构解析成功；或抓包实体已完整重组/解密。
+- **不完整**：缺少部分分片，无法生成完整二进制；或 API 流缺少会话密钥、存在未解密记录。
+- **错误**：分片总数冲突、Base64URL 解码失败、包结构错误、尾随字节、同索引载荷冲突、HMAC 校验失败等。
 
-> “已解析”仅表示结构符合 `PacketCodec`，**不代表**签名已验证、密文已认证或发送者已受信任。
+> “已解析”仅表示结构符合 `PacketCodec`，**不代表**签名已验证、密文已认证或发送者已受信任；签名与解密结果分别显示。
 
 ### 字段与字节高亮
 
@@ -124,6 +213,8 @@ GUI 快捷方式：
 - `i32`/`u32` 长度字段的字节范围包含长度前缀。
 - AEAD 密文会进一步拆为“加密正文”和“16 字节认证标签”。
 - 混合 KEM/签名算法只展示总长度，不猜测其内部复合编码。
+- 抓包控制消息按 VarInt/UTF-8/UUID/i32/i64 的真实编码映射到原始控制负载；`EXCHANGE` 内层包的字段偏移会自动换算到控制体位置。
+- 公钥共享的 JSON 文本会定位 `owner`、算法、UUID、指纹等值；`krypt04mcg_file:stream` 会标注文件名长度、文件名、声明大小和文件内容的精确范围。
 
 点击字段后，右侧十六进制视图中该范围会以黄色背景显示，ASCII 列同步高亮。若所选字段长度为 0（例如会话消息中不存在的 KEM 算法字段），会显示“该字段不占用字节”。
 
@@ -171,7 +262,18 @@ GUI 快捷方式：
 - **不支持**：算法不在本工具实现范围内（例如 CMCE/HQC/NTRU/S-NTRU KEM、RSA/ECDH 复合 KEM），或遇到临时 KEM 响应。
 - **解密失败**：找到匹配密钥，但 KEM 解封装、AEAD 认证或解压失败。展开“已尝试的密钥”可查看每个候选的具体错误。
 
-> 解密成功只表示 **AEAD 标签验证通过**，即密文由持有该密钥的一方生成。本工具**不验证** PQ 签名，也不建立发送者身份信任、新鲜度或重放结论。日志会同时记录双向消息，因此加载多个玩家的私钥可以解密各自收到的包。
+> 解密成功只表示 **AEAD 标签验证通过**，即密文由持有该密钥的一方生成。签名验证独立进行：只有加载了发送者的签名公钥且算法受支持时才会显示“签名有效”。验签通过也不建立额外的信任、新鲜度或重放结论。日志会同时记录双向消息，因此加载多个玩家的私钥可以解密各自收到的包。
+
+### 验签结果
+
+选中消息后，“验签结果”面板显示：
+
+- **签名有效**：使用 `packet.sender` 匹配到的签名公钥验证通过。
+- **缺少公钥**：没有该所有者的签名公钥；可从 `keys/public/*.json`、`local.json` 或抓包公钥共享加载。
+- **不支持**：签名算法不在本工具实现范围内。
+- **签名无效**：找到公钥但签名、公钥编码或算法声明不匹配。
+
+公钥列表在密钥窗口（`Ctrl+K`）中，可单独移除；移除后立即重新验签。抓包模式下，完整的 `krypt04mcg:public_key` 共享会自动注册为签名公钥。
 
 ## 协议解析范围
 
@@ -217,9 +319,9 @@ i32  signatureLength + signature        (omitted for SESSION_MESSAGE)
 {
   "tool": "K04M 日志解析器",
   "version": "0.1.0",
-  "format_version": 2,
+  "format_version": 3,
   "exported_at_utc": "...",
-  "cryptographic_verification": false,
+  "cryptographic_verification": true,
   "payload_decrypted": true,
   "decryption_summary": {
     "decrypted_messages": 3,
@@ -227,6 +329,14 @@ i32  signatureLength + signature        (omitted for SESSION_MESSAGE)
     "unsupported_messages": 1,
     "failed_messages": 0,
     "not_attempted": 1
+  },
+  "signature_summary": {
+    "signed_packets": 4,
+    "verified": 2,
+    "no_public_key": 1,
+    "unsupported": 1,
+    "failed": 0,
+    "not_present_or_not_attempted": 9
   },
   "summary": {
     "source_files": 7,
@@ -249,6 +359,7 @@ i32  signatureLength + signature        (omitted for SESSION_MESSAGE)
 - `binary_length`、`binary_base64url`、`binary_hex`（完整重组二进制）
 - `packet`：解析后的结构字段、算法、时间戳、session 信息、`fields` 字段树
 - `decryption`：解密状态、匹配的密钥所有者/来源/算法、`key_kind`（`private_key` 或 `session_secret`）、是否解压、明文字节长度、`plaintext`（合法 UTF-8 时）、`json`（明文为 JSON 对象/数组时）、`plaintext_hex`、`plaintext_base64url`、错误信息与全部候选密钥尝试
+- `signature`：验签状态、声称的签名者、匹配公钥的所有者/来源/算法、错误信息与全部候选公钥尝试
 - `fragments`：每个物理分片所在文件、行号、时间和载荷
 
 导出**不包含任何私钥或会话密钥材料**；只包含解密结果和密钥所有者/来源等来源信息。
@@ -274,9 +385,9 @@ i32  signatureLength + signature        (omitted for SESSION_MESSAGE)
 - AEAD 支持 `AES-256-GCM` 与 `ChaCha20-Poly1305`。流通道使用的 XChaCha20-Poly1305 不在此工具的数据包解密范围内。
 - 会话交换响应使用一次性临时 KEM 公钥加密，临时私钥不落盘，通常无法从日志解密；会话消息需要账户 `sessions/` 中的会话密钥。
 - Windows DPAPI 主密钥绑定创建它的 Windows 用户配置文件；换用户、换机器或复制到 Linux/macOS 后无法解包（除非有漫游配置文件或 DPAPI 备份密钥）。
-- **不执行签名验证**、发送者信任、新鲜度或重放检查。AEAD 认证成功不等于发送者身份可信。
+- 签名验证依赖发送者公钥。Falcon、SQIsign、SNOVA、MAYO、UOV、RSA/ECDSA 复合等未实现的算法显示为“不支持”；AEAD 认证成功不等于发送者身份可信。
 - 包时间戳是发送方声明值，未经过本工具认证；日志行时间来自服务器日志。
-- 混合 KEM 封装和混合签名内部由 Bouncy Castle 复合格式定义，本工具只展示整体字节范围（解密封装除外）。
+- 混合 KEM 封装内部由 Bouncy Castle 复合格式定义，本工具只展示整体字节范围（解密封装除外）；混合签名可以验证，但字段树仍只展示整体字节范围。
 - 超大日志会一次性读入内存并同步解析；当前目标场景是 Minecraft `logs/` 目录（通常几十 MB 以内）。
 
 ## GitHub Actions
@@ -294,7 +405,7 @@ i32  signatureLength + signature        (omitted for SESSION_MESSAGE)
 3. **Release build**：测试通过后，在 Linux、Windows、macOS 上分别执行 `cargo build --release --locked`。
 4. **Artifacts**：将三平台 release 二进制上传到本次 Actions 运行页面，保留 14 天。artifact 名称格式为 `k04m-log-parser-<OS>-<ARCH>`。
 
-无需在仓库中配置任何 secrets；`Cargo.lock` 已锁定依赖版本。发布 job 已在工作流中显式申请 `contents: write`，用于创建 GitHub Release。
+CI 本身无需 secrets；`Cargo.lock` 已锁定依赖版本。发布 job 已在工作流中显式申请 `contents: write`，用于创建 GitHub Release。可选配置仓库 secret `VT_API_KEY`（VirusTotal API key）以启用发布包的 VirusTotal 扫描；未配置时会跳过扫描及 release notes 中的扫描链接。
 
 ### 发布 Release
 
@@ -315,6 +426,9 @@ i32  signatureLength + signature        (omitted for SESSION_MESSAGE)
 4. 生成 `SHA256SUMS.txt`。
 5. 创建 GitHub Release，上传全部包和校验和，并自动生成 release notes。
    带 `-` 的版本 tag（如 `v0.2.0-rc.1`）会标记为 pre-release。
+6. 如果配置了 `VT_API_KEY`，将 `dist/` 中的发布包提交 VirusTotal 扫描，并在 release notes 末尾追加每个包的 SHA-256 与 VirusTotal 报告链接（重复发布会替换这一节，不会重复追加；扫描失败不会阻塞发布）。
+
+VirusTotal 扫描需要在 GitHub 仓库 **Settings → Secrets and variables → Actions** 中添加 secret `VT_API_KEY`；未配置时发布流程不会调用 VirusTotal。
 
 发布示例：
 
@@ -341,7 +455,8 @@ cargo clippy --all-targets -- -D warnings
 | `src/fragment.rs` | 分片行识别、分组、重组、冲突检测 |
 | `src/log_reader.rs` | 文件/目录发现、gzip、逐行扫描、日期推断 |
 | `src/packet.rs` | v1–v4 二进制包结构解析、字段偏移与字段树 |
-| `src/decrypt.rs` | 私钥/会话密钥加载、KMCGSEC1、KEM 解封装、AAD 重建、AEAD 解密 |
+| `src/decrypt.rs` | 私钥/会话密钥/签名公钥加载、KMCGSEC1、KEM 解封装、AAD 重建、AEAD 解密 |
+| `src/signature.rs` | 公钥登记、规范签名输入、ML-DSA/SLH-DSA/混合与复合签名验证 |
 | `src/export.rs` | 完整 JSON 导出 |
 | `src/app.rs` | egui 界面、消息列表、字段/十六进制联动、密钥与明文面板 |
 | `src/model.rs` | 数据模型 |
@@ -358,6 +473,8 @@ cargo clippy --all-targets -- -D warnings
 - SESSION_EXCHANGE 请求
 - KMCGSEC1 加密账户目录（`secrets/master.key` + `keys/private/local.json` + `sessions/`）
 - Windows-only 测试：在 Windows CI 上用 `CryptProtectData` 生成 mode-1 主密钥，验证 DPAPI 解包与 KMCGSEC1 路径 AAD 的完整链路；Linux/macOS 构建不包含该分支
+
+`tests/data/signature-vectors.json` 覆盖 BC 原生复合签名、独立 ML-DSA/SLH-DSA 以及自定义混合签名；由 `tools/generate_signature_vectors.java` 生成。
 
 重新生成（需要先构建 Krypt04Mcg，并准备 BC 1.86 与 Gson jar）：
 

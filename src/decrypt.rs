@@ -9,10 +9,11 @@
 //! * AEAD: AES-256-GCM and ChaCha20-Poly1305.
 //! * KDF: HKDF-SHA256 with the project's domain labels.
 //!
-//! Signature verification is intentionally not performed: it would require the
-//! post-quantum signature public keys and is unrelated to recovering plaintext.
-//! A successful decryption authenticates the ciphertext under the loaded key but
-//! does not prove the claimed sender identity.
+//! Private keys, session secrets and public signature keys are loaded here.
+//! Signature verification itself lives in [`crate::signature`]; it is
+//! independent of decryption. A successful decryption authenticates the
+//! ciphertext under the loaded key but does not by itself prove the claimed
+//! sender identity.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,19 +21,22 @@ use std::path::{Path, PathBuf};
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit, Nonce, Payload};
 use base64::Engine as _;
-use chacha20poly1305::ChaCha20Poly1305;
+use chacha20poly1305::{ChaCha20Poly1305, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use ml_kem::{Decapsulate, MlKem512, MlKem768, MlKem1024};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use sha3::Sha3_256;
+use uuid::Uuid;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 
 use crate::model::{
     DecryptionAttempt, DecryptionOutcome, DecryptionStatus, FragmentGroup, LoadedLogs,
-    MessageStatus, ParsedPacket,
+    MessageStatus, ParsedPacket, SignatureOutcome,
 };
 use crate::packet::{FLAG_COMPRESSED, FLAG_SESSION_RESPONSE, FLAG_SIGNED, hex};
+use crate::signature::SignatureKeyRegistry;
 
 const HYBRID_MAGIC: u32 = 0x4b30_3401;
 const HYBRID_MAX_COMPONENT: usize = 2 * 1024 * 1024;
@@ -61,6 +65,8 @@ const COMPOSITE_1024_X448_LABEL: &[u8] = b"MLKEM1024-X448";
 pub struct KeyStore {
     pub private_keys: Vec<PrivateKeyEntry>,
     pub sessions: Vec<SessionEntry>,
+    /// Public signature keys used to verify signed packet envelopes.
+    pub signatures: SignatureKeyRegistry,
     pub sources: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -92,6 +98,7 @@ pub struct KeyLoadSummary {
     pub files_scanned: usize,
     pub keys_added: usize,
     pub sessions_added: usize,
+    pub public_keys_added: usize,
     pub duplicate_keys: usize,
     pub duplicate_sessions: usize,
     pub warnings: Vec<String>,
@@ -100,8 +107,8 @@ pub struct KeyLoadSummary {
 impl KeyLoadSummary {
     pub fn message(&self) -> String {
         let mut text = format!(
-            "扫描 {} 个文件，新增 {} 个私钥、{} 个会话密钥",
-            self.files_scanned, self.keys_added, self.sessions_added
+            "扫描 {} 个文件，新增 {} 个私钥、{} 个会话密钥、{} 个签名公钥",
+            self.files_scanned, self.keys_added, self.sessions_added, self.public_keys_added
         );
         if self.duplicate_keys > 0 || self.duplicate_sessions > 0 {
             text.push_str(&format!(
@@ -116,14 +123,285 @@ impl KeyLoadSummary {
     }
 }
 
+/// Which direction key a captured raw-channel record needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamKeyDirection {
+    /// The captured client sent the record (`data/.../<local>/<peer>`).
+    Send,
+    /// The captured client received the record (`data/.../<peer>/<local>`).
+    Receive,
+}
+
+/// One direction of one `krypt04mcg_stream:data/N` record stream.
+///
+/// Krypt04Mcg derives a fresh XChaCha20-Poly1305 key for every stream,
+/// direction and business channel. The nonce is the stream UUID followed by an
+/// implicit record counter, and the AAD binds the session, stream, slot and
+/// business channel. Records carry no explicit counter, so records must be
+/// decrypted in capture order.
+pub struct StreamRecordCipher {
+    key: [u8; 32],
+    aad: Vec<u8>,
+    stream_id: Uuid,
+    counter: u64,
+}
+
+impl StreamRecordCipher {
+    /// Number of successfully authenticated records so far.
+    pub fn counter(&self) -> u64 {
+        self.counter
+    }
+
+    /// Authenticates and decrypts the next record. The counter advances only
+    /// after successful authentication, matching Krypt04Mcg's `ChannelCrypto`.
+    pub fn decrypt_next(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+        if ciphertext.len() < 16 {
+            return Err("流记录短于 16 字节认证标签".to_owned());
+        }
+        if self.counter >= i64::MAX as u64 {
+            return Err("流记录计数器耗尽".to_owned());
+        }
+        let mut nonce = [0u8; 24];
+        nonce[..16].copy_from_slice(self.stream_id.as_bytes());
+        nonce[16..].copy_from_slice(&self.counter.to_be_bytes());
+        let cipher = XChaCha20Poly1305::new_from_slice(&self.key)
+            .map_err(|_| "无法初始化 XChaCha20-Poly1305".to_owned())?;
+        let nonce = XNonce::try_from(&nonce[..])
+            .map_err(|_| "XChaCha20-Poly1305 nonce 长度无效".to_owned())?;
+        let plaintext = cipher
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: &self.aad,
+                },
+            )
+            .map_err(|_| {
+                format!(
+                    "XChaCha20-Poly1305 认证失败（第 {} 条记录；密钥、AAD 或记录顺序不匹配）",
+                    self.counter
+                )
+            })?;
+        self.counter += 1;
+        Ok(plaintext)
+    }
+}
+
+impl Drop for StreamRecordCipher {
+    fn drop(&mut self) {
+        self.key.fill(0);
+    }
+}
+
 impl KeyStore {
+    /// Derives the per-stream, per-direction record cipher from a loaded
+    /// `stream-api` session secret.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_cipher(
+        &self,
+        session_id: &str,
+        stream_id: Uuid,
+        slot: i32,
+        channel: &str,
+        local: &str,
+        peer: &str,
+        direction: StreamKeyDirection,
+    ) -> Result<StreamRecordCipher, String> {
+        if local.eq_ignore_ascii_case(peer) {
+            return Err("流两端身份相同，无法派生方向密钥".to_owned());
+        }
+        let session = self
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .ok_or_else(|| {
+                format!(
+                    "没有 sessionId 为 {session_id} 的会话密钥。请加载 Krypt04Mcg 账户目录中的 stream-api/sessions/ 或聊天 sessions/。"
+                )
+            })?;
+        let salt = decode_base64url(session_id)?;
+        let context = format!("{session_id}/{stream_id}/{slot}/{channel}");
+        let (source, target) = match direction {
+            StreamKeyDirection::Send => (local, peer),
+            StreamKeyDirection::Receive => (peer, local),
+        };
+        let info = format!(
+            "krypt04mcg_stream/v1/data/{context}/{}/{}",
+            source.to_ascii_lowercase(),
+            target.to_ascii_lowercase()
+        );
+        let key = hkdf_sha256(&session.secret, Some(&salt), info.as_bytes())?;
+        let aad = format!("krypt04mcg_stream/v1/{context}").into_bytes();
+        Ok(StreamRecordCipher {
+            key,
+            aad,
+            stream_id,
+            counter: 0,
+        })
+    }
+
+    /// Verifies a control-channel HMAC produced by `ChannelCrypto.authenticate`.
+    /// `kind` must be the wire enum name (`OPEN`, `READY`, ...); `slot_for_mac`
+    /// is `-1` for `OPEN` and the assigned slot for every other kind.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_stream_control(
+        &self,
+        session_id: &str,
+        source: &str,
+        target: &str,
+        kind: &str,
+        stream_id: Uuid,
+        slot_for_mac: i32,
+        channel: &str,
+        sequence: i64,
+        body: &[u8],
+    ) -> Result<bool, String> {
+        let session = self
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .ok_or_else(|| format!("没有 sessionId 为 {session_id} 的会话密钥"))?;
+        let salt = decode_base64url(session_id)?;
+        let info = format!(
+            "krypt04mcg_stream/v1/control/{}/{}",
+            source.to_ascii_lowercase(),
+            target.to_ascii_lowercase()
+        );
+        let key = hkdf_sha256(&session.secret, Some(&salt), info.as_bytes())?;
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key)
+            .map_err(|_| "无法初始化 HMAC-SHA256".to_owned())?;
+        let text = format!("{kind}/{stream_id}/{slot_for_mac}/{channel}/{session_id}/{sequence}");
+        mac.update(text.as_bytes());
+        Ok(mac.verify_slice(body).is_ok())
+    }
+
+    /// Decrypts a legacy `krypt04mcg:tunnel` envelope. The envelope carries a
+    /// stream UUID and lease followed by a `SESSION_MESSAGE` packet whose
+    /// session key is derived from the chat session secret with the tunnel
+    /// domain separator.
+    pub fn decrypt_legacy_tunnel(
+        &self,
+        binary: &[u8],
+        stream_id: Uuid,
+        lease: i64,
+    ) -> DecryptionOutcome {
+        let packet = crate::packet::parse_packet(binary);
+        let mut outcome = DecryptionOutcome::default();
+        if packet.error.is_some() || packet.packet_type != Some(4) {
+            outcome.status = DecryptionStatus::Unsupported;
+            outcome.error = Some("隧道内层不是可解析的 SESSION_MESSAGE".to_owned());
+            return outcome;
+        }
+        if lease < 0 {
+            outcome.status = DecryptionStatus::Failed;
+            outcome.error = Some("隧道 lease 为负数".to_owned());
+            return outcome;
+        }
+        let Some(session_id) = packet.session_id.as_deref() else {
+            outcome.status = DecryptionStatus::Unsupported;
+            outcome.error = Some("隧道内层缺少 sessionId".to_owned());
+            return outcome;
+        };
+        outcome.session_id = Some(session_id.to_owned());
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+        else {
+            outcome.status = DecryptionStatus::NoKey;
+            outcome.error = Some(format!("没有 sessionId 为 {session_id} 的会话密钥"));
+            return outcome;
+        };
+        let result = (|| -> Result<Vec<u8>, String> {
+            let salt = decode_base64url(session_id)?;
+            let info = format!(
+                "krypt04mcg tunnel v1\n{stream_id}\n{lease}\n{}\n{}",
+                packet.sender.to_ascii_lowercase(),
+                packet.receiver.to_ascii_lowercase()
+            );
+            let tunnel_key = hkdf_sha256(&session.secret, Some(&salt), info.as_bytes())?;
+            let message_id = decode_hex(&packet.message_id_hex)?;
+            if message_id.len() != 16 {
+                return Err("messageId 长度不是 16 字节".to_owned());
+            }
+            let derived = hkdf_sha256(&tunnel_key, Some(&message_id), b"krypt04mcg session")?;
+            let nonce = slice_field(binary, packet.nonce_data_offset, packet.nonce_len)?;
+            let ciphertext =
+                slice_field(binary, packet.ciphertext_data_offset, packet.ciphertext_len)?;
+            let aad = build_aad(&packet)?;
+            let plaintext =
+                aead_decrypt(&packet.algorithms.aead, &derived, nonce, &aad, ciphertext)?;
+            maybe_inflate(plaintext, packet.flags.unwrap_or(0) & FLAG_COMPRESSED != 0)
+        })();
+        match result {
+            Ok(plaintext) => {
+                outcome.status = DecryptionStatus::Decrypted;
+                outcome.key_owner = Some(session.peer.clone());
+                outcome.key_source = Some(session.source.clone());
+                outcome.key_algorithm = Some(packet.algorithms.aead.clone());
+                outcome.key_kind = Some("session_secret".to_owned());
+                outcome.attempts.push(DecryptionAttempt {
+                    key_owner: session.peer.clone(),
+                    key_source: session.source.clone(),
+                    key_kind: "session_secret".to_owned(),
+                    algorithm: packet.algorithms.aead.clone(),
+                    success: true,
+                    error: None,
+                });
+                let compressed = packet.flags.unwrap_or(0) & FLAG_COMPRESSED != 0;
+                finish_plaintext(&mut outcome, plaintext, compressed);
+            }
+            Err(error) => {
+                outcome.status = DecryptionStatus::Failed;
+                outcome.error = Some(error);
+            }
+        }
+        outcome
+    }
+
+    /// Parses, decrypts and verifies a complete Krypt04Mcg packet envelope
+    /// carried inside a stream control message.
+    pub fn analyze_packet(
+        &self,
+        binary: &[u8],
+    ) -> (ParsedPacket, DecryptionOutcome, SignatureOutcome) {
+        let packet = crate::packet::parse_packet(binary);
+        let status = if packet.error.is_none() {
+            MessageStatus::Parsed
+        } else {
+            MessageStatus::Invalid
+        };
+        let group = FragmentGroup {
+            kind: crate::model::MessageKind::Chat,
+            message_id: packet.message_id_hex.clone(),
+            transport_sender: packet.sender.clone(),
+            total: 1,
+            slots: Default::default(),
+            first_seen: Default::default(),
+            last_seen: Default::default(),
+            first_order: 0,
+            duplicate_count: 0,
+            conflicts: 0,
+            warnings: Vec::new(),
+            binary: Some(binary.to_vec()),
+            packet: Some(packet.clone()),
+            status,
+            decryption: None,
+            signature: None,
+        };
+        let outcome = self.decrypt_message(&group);
+        let signature = self.signatures.verify_packet(&packet, binary);
+        (packet, outcome, signature)
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.private_keys.is_empty() && self.sessions.is_empty()
+        self.private_keys.is_empty() && self.sessions.is_empty() && self.signatures.is_empty()
     }
 
     pub fn clear(&mut self) {
         self.private_keys.clear();
         self.sessions.clear();
+        self.signatures.clear();
         self.sources.clear();
         self.warnings.clear();
     }
@@ -145,7 +423,10 @@ impl KeyStore {
             if local.is_file() {
                 self.note_source(path);
                 self.load_file(&local, summary);
+                self.load_public_dir(&path.join("keys").join("public"), summary);
+                self.load_self_public_export(path, summary);
                 self.load_sessions_dir(path, summary);
+                self.load_stream_api_dir(path, summary);
                 return;
             }
             // Also accept the `keys` directory itself.
@@ -154,7 +435,28 @@ impl KeyStore {
                 self.note_source(path);
                 self.load_file(&nested_local, summary);
                 if let Some(account_root) = path.parent() {
+                    self.load_public_dir(&path.join("public"), summary);
+                    self.load_self_public_export(account_root, summary);
                     self.load_sessions_dir(account_root, summary);
+                    self.load_stream_api_dir(account_root, summary);
+                }
+                return;
+            }
+
+            // A `stream-api` root has its own secrets/master.key and sessions/.
+            if path.join("secrets").join("master.key").is_file() && path.join("sessions").is_dir() {
+                self.note_source(path);
+                self.load_sessions_in(&path.join("sessions"), summary);
+                return;
+            }
+
+            // A standalone `keys/public` directory (or a `keys` directory
+            // without private material).
+            if path.join("public").is_dir() {
+                self.note_source(path);
+                self.load_public_dir(&path.join("public"), summary);
+                if path.join("private").join("local.json").is_file() {
+                    self.load_file(&path.join("private").join("local.json"), summary);
                 }
                 return;
             }
@@ -167,7 +469,10 @@ impl KeyStore {
                     if local.is_file() {
                         self.load_file(&local, summary);
                     }
+                    self.load_public_dir(&root.join("keys").join("public"), summary);
+                    self.load_self_public_export(&root, summary);
                     self.load_sessions_dir(&root, summary);
+                    self.load_stream_api_dir(&root, summary);
                 }
                 return;
             }
@@ -204,8 +509,47 @@ impl KeyStore {
     }
 
     fn load_sessions_dir(&mut self, account_root: &Path, summary: &mut KeyLoadSummary) {
-        let dir = account_root.join("sessions");
-        let Ok(entries) = fs::read_dir(&dir) else {
+        self.load_sessions_in(&account_root.join("sessions"), summary);
+    }
+
+    /// Loads `keys/public/*.json`, the public identities exchanged over the
+    /// `krypt04mcg:public_key` channel.
+    fn load_public_dir(&mut self, dir: &Path, summary: &mut KeyLoadSummary) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                candidate.is_file()
+                    && candidate
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            })
+            .collect();
+        files.sort();
+        for file in files {
+            self.load_file(&file, summary);
+        }
+    }
+
+    fn load_self_public_export(&mut self, account_root: &Path, summary: &mut KeyLoadSummary) {
+        let path = account_root.join("export").join("self-public.json");
+        if path.is_file() {
+            self.load_file(&path, summary);
+        }
+    }
+
+    /// Loads the separate `stream-api/sessions/` ledger used by the raw
+    /// encrypted channel transport. It has its own `secrets/master.key`, so the
+    /// files are decrypted independently of the chat session directory.
+    fn load_stream_api_dir(&mut self, account_root: &Path, summary: &mut KeyLoadSummary) {
+        self.load_sessions_in(&account_root.join("stream-api").join("sessions"), summary);
+    }
+
+    fn load_sessions_in(&mut self, dir: &Path, summary: &mut KeyLoadSummary) {
+        let Ok(entries) = fs::read_dir(dir) else {
             return;
         };
         let mut files: Vec<PathBuf> = entries
@@ -272,12 +616,27 @@ impl KeyStore {
                 }
             }
             serde_json::Value::Object(object) => {
-                if object.contains_key("kemPrivateKey") || object.contains_key("kemPublicKey") {
+                if object.contains_key("kemPrivateKey") {
                     self.ingest_local_material(value, path, summary);
+                } else if object.contains_key("signaturePublicKey") {
+                    self.ingest_public_identity(value, path, summary);
                 } else if object.contains_key("stateVersion") || object.contains_key("session") {
                     self.ingest_session_state(value, path, summary);
                 } else if object.contains_key("keyData") {
-                    if let Ok(record) = serde_json::from_value::<KeyRecordJson>(value.clone()) {
+                    let algorithm = object
+                        .get("algorithm")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if algorithm.to_ascii_lowercase().ends_with("/public") {
+                        if self
+                            .signatures
+                            .ingest_record_value(value, &path.display().to_string())
+                        {
+                            summary.public_keys_added += 1;
+                        }
+                    } else if let Ok(record) =
+                        serde_json::from_value::<KeyRecordJson>(value.clone())
+                    {
                         self.add_key_record(&record, None, path, summary);
                     }
                 } else if object.contains_key("secret") && object.contains_key("sessionId") {
@@ -296,12 +655,32 @@ impl KeyStore {
         }
     }
 
+    fn ingest_public_identity(
+        &mut self,
+        value: &serde_json::Value,
+        path: &Path,
+        summary: &mut KeyLoadSummary,
+    ) {
+        if self
+            .signatures
+            .ingest_identity_value(value, &path.display().to_string())
+        {
+            summary.public_keys_added += 1;
+        }
+    }
+
     fn ingest_local_material(
         &mut self,
         value: &serde_json::Value,
         path: &Path,
         summary: &mut KeyLoadSummary,
     ) {
+        if self
+            .signatures
+            .ingest_identity_value(value, &path.display().to_string())
+        {
+            summary.public_keys_added += 1;
+        }
         let Some(kem_private) = value.get("kemPrivateKey") else {
             self.warn(summary, format!("{} 缺少 kemPrivateKey", path.display()));
             return;
@@ -508,10 +887,25 @@ impl KeyStore {
     // Decryption
     // -----------------------------------------------------------------------
 
-    /// Recomputes decryption for every reassembled message.
+    /// Recomputes decryption and signature verification for every reassembled
+    /// message.
     pub fn decrypt_loaded(&self, loaded: &mut LoadedLogs) {
         for message in &mut loaded.messages {
             message.decryption = Some(self.decrypt_message(message));
+            message.signature = Some(self.verify_message(message));
+        }
+    }
+
+    /// Verifies one reassembled packet signature against the loaded public
+    /// keys. Independent of payload decryption.
+    pub fn verify_message(&self, message: &FragmentGroup) -> SignatureOutcome {
+        match (&message.packet, message.binary.as_deref()) {
+            (Some(packet), Some(binary)) => self.signatures.verify_packet(packet, binary),
+            _ => SignatureOutcome {
+                status: crate::model::SignatureStatus::NotAttempted,
+                error: Some("消息不完整或缺少二进制，无法验证签名".to_owned()),
+                ..SignatureOutcome::default()
+            },
         }
     }
 
@@ -828,7 +1222,7 @@ fn slice_field(binary: &[u8], offset: usize, length: usize) -> Result<&[u8], Str
 // AAD reconstruction (PacketCodec.aadFor)
 // ---------------------------------------------------------------------------
 
-fn build_aad(packet: &ParsedPacket) -> Result<Vec<u8>, String> {
+pub(crate) fn build_aad(packet: &ParsedPacket) -> Result<Vec<u8>, String> {
     let version = packet
         .protocol_version
         .ok_or_else(|| "缺少协议版本".to_owned())?;
@@ -1994,6 +2388,163 @@ mod tests {
             let _ = LocalFree(output.pbData as _);
         }
         Ok(bytes)
+    }
+
+    fn store_with_session(session_id: &str, secret: &str, name: &str) -> KeyStore {
+        let root = std::env::temp_dir().join(format!(
+            "k04m-log-parser-session-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let record = serde_json::json!({
+            "peer": "Bob",
+            "sessionId": session_id,
+            "secret": secret,
+        });
+        fs::write(
+            root.join("session.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let mut store = KeyStore::default();
+        let summary = store.load_paths(std::slice::from_ref(&root));
+        assert_eq!(summary.sessions_added, 1, "{:?}", summary.warnings);
+        let _ = fs::remove_dir_all(&root);
+        store
+    }
+
+    #[test]
+    fn stream_cipher_matches_bouncy_castle_vector() {
+        // Generated with Krypt04Mcg's ChannelCrypto derivation and Bouncy
+        // Castle's XChaCha20-Poly1305. The secret is a test-only value.
+        let session_id = "oKGio6SlpqeoqaqrrK2urw";
+        let secret = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+        let stream_id = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let ciphertext = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode("LJvAk3oPJN8aAEs3wVuyu8v5OsI7vkGKL2BwEEYhK3RmzHWCGYJi")
+            .unwrap();
+        let store = store_with_session(session_id, secret, "stream-vector");
+
+        let mut cipher = store
+            .stream_cipher(
+                session_id,
+                stream_id,
+                0,
+                "example:test",
+                "alice",
+                "Bob",
+                StreamKeyDirection::Send,
+            )
+            .unwrap();
+        let plaintext = cipher.decrypt_next(&ciphertext).unwrap();
+        assert_eq!(plaintext, b"hello krypt04mcg stream");
+        assert_eq!(cipher.counter(), 1);
+
+        // The receiver derives the same key with the endpoint order reversed.
+        let mut mirror = store
+            .stream_cipher(
+                session_id,
+                stream_id,
+                0,
+                "example:test",
+                "bob",
+                "alice",
+                StreamKeyDirection::Receive,
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.decrypt_next(&ciphertext).unwrap(),
+            b"hello krypt04mcg stream"
+        );
+    }
+
+    #[test]
+    fn stream_control_hmac_matches_bouncy_castle_vector() {
+        let session_id = "oKGio6SlpqeoqaqrrK2urw";
+        let secret = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+        let stream_id = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let tag = hex_decode("041c5af5d648f06aef9a9acd9c495dd4d46cd9639f3ff075448272d4f632e1ff");
+        let store = store_with_session(session_id, secret, "control-vector");
+        assert!(
+            store
+                .verify_stream_control(
+                    session_id,
+                    "alice",
+                    "Bob",
+                    "OPEN",
+                    stream_id,
+                    -1,
+                    "example:test",
+                    5,
+                    &tag,
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .verify_stream_control(
+                    session_id,
+                    "alice",
+                    "Bob",
+                    "OPEN",
+                    stream_id,
+                    0,
+                    "example:test",
+                    5,
+                    &tag,
+                )
+                .unwrap()
+        );
+    }
+
+    fn hex_decode(text: &str) -> Vec<u8> {
+        text.as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                let high = hex_digit(pair[0]).unwrap();
+                let low = hex_digit(pair[1]).unwrap();
+                (high << 4) | low
+            })
+            .collect()
+    }
+
+    #[test]
+    fn loads_stream_api_session_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "k04m-log-parser-stream-api-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let stream_api = root.join("stream-api");
+        fs::create_dir_all(stream_api.join("secrets")).unwrap();
+        fs::create_dir_all(stream_api.join("sessions")).unwrap();
+        let mut master = Vec::new();
+        master.extend_from_slice(MASTER_KEY_MAGIC);
+        master.push(2);
+        master.extend_from_slice(&[7u8; 32]);
+        fs::write(stream_api.join("secrets").join("master.key"), master).unwrap();
+        let record = serde_json::json!({
+            "stateVersion": 1,
+            "session": {
+                "peer": "alice",
+                "sessionId": "oKGio6SlpqeoqaqrrK2urw",
+                "secret": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+            }
+        });
+        fs::write(
+            stream_api.join("sessions").join("alice.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+
+        let mut store = KeyStore::default();
+        let summary = store.load_paths(std::slice::from_ref(&stream_api));
+        assert_eq!(summary.sessions_added, 1, "{:?}", summary.warnings);
+        assert_eq!(store.sessions[0].session_id, "oKGio6SlpqeoqaqrrK2urw");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

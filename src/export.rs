@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::model::{
     DecryptionOutcome, DecryptionStatus, FragmentGroup, FragmentOccurrence, LoadedLogs,
-    LogTimestamp, MessageStatus, ParsedPacket, SourceInfo,
+    LogTimestamp, MessageStatus, ParsedPacket, SignatureOutcome, SignatureStatus, SourceInfo,
 };
 use crate::packet::hex;
 
@@ -21,12 +21,13 @@ struct ExportDocument<'a> {
     format_version: u32,
     exported_at_utc: String,
     exported_at_local: String,
-    /// Signatures are not verified; successful AEAD decryption authenticates
-    /// the ciphertext under a loaded key but not the claimed sender identity.
+    /// True when at least one packet signature was verified with a loaded
+    /// sender public key.
     cryptographic_verification: bool,
     /// True when at least one packet was authenticated and decrypted.
     payload_decrypted: bool,
     decryption_summary: DecryptionSummary,
+    signature_summary: SignatureSummary,
     summary: ExportSummary,
     sources: Vec<&'a SourceInfo>,
     messages: Vec<ExportMessage<'a>>,
@@ -39,6 +40,16 @@ struct DecryptionSummary {
     unsupported_messages: usize,
     failed_messages: usize,
     not_attempted: usize,
+}
+
+#[derive(Serialize)]
+struct SignatureSummary {
+    signed_packets: usize,
+    verified: usize,
+    no_public_key: usize,
+    unsupported: usize,
+    failed: usize,
+    not_present_or_not_attempted: usize,
 }
 
 #[derive(Serialize)]
@@ -77,6 +88,9 @@ struct ExportMessage<'a> {
     /// Authenticated plaintext and key provenance, when decryption was attempted.
     #[serde(skip_serializing_if = "Option::is_none")]
     decryption: Option<&'a DecryptionOutcome>,
+    /// Signature verification against a loaded sender public key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<&'a SignatureOutcome>,
     fragments: Vec<&'a FragmentOccurrence>,
 }
 
@@ -123,15 +137,25 @@ fn build_document(loaded: &LoadedLogs) -> ExportDocument<'_> {
             .count()
             + count_status(loaded, DecryptionStatus::NotAttempted),
     };
+    let signature_summary = SignatureSummary {
+        signed_packets: loaded.signed_packet_count(),
+        verified: loaded.signature_count(SignatureStatus::Verified),
+        no_public_key: loaded.signature_count(SignatureStatus::NoKey),
+        unsupported: loaded.signature_count(SignatureStatus::Unsupported),
+        failed: loaded.signature_count(SignatureStatus::Failed),
+        not_present_or_not_attempted: loaded.signature_count(SignatureStatus::NotPresent)
+            + loaded.signature_count(SignatureStatus::NotAttempted),
+    };
     ExportDocument {
         tool: "K04M 日志解析器",
         version: env!("CARGO_PKG_VERSION"),
-        format_version: 2,
+        format_version: 3,
         exported_at_utc: now_utc.to_rfc3339(),
         exported_at_local: now_utc.with_timezone(&Local).to_rfc3339(),
-        cryptographic_verification: false,
+        cryptographic_verification: signature_summary.verified > 0,
         payload_decrypted: decryption_summary.decrypted_messages > 0,
         decryption_summary,
+        signature_summary,
         summary: ExportSummary {
             source_files: loaded.sources.len(),
             fragment_lines: loaded.fragment_lines,
@@ -167,6 +191,7 @@ fn build_message<'a>(message: &'a FragmentGroup) -> ExportMessage<'a> {
         binary_hex: binary.map(hex),
         packet: message.packet.as_ref(),
         decryption: message.decryption.as_ref(),
+        signature: message.signature.as_ref(),
         fragments: message.all_occurrences_sorted(),
     }
 }
