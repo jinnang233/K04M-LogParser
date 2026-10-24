@@ -394,7 +394,7 @@ i32  signatureLength + signature        (omitted for SESSION_MESSAGE)
 3. **Release build**：测试通过后，在 Linux、Windows、macOS 上分别执行 `cargo build --release --locked`。
 4. **Artifacts**：将三平台 release 二进制上传到本次 Actions 运行页面，保留 14 天。artifact 名称格式为 `k04m-log-parser-<OS>-<ARCH>`。
 
-无需在仓库中配置任何 secrets；`Cargo.lock` 已锁定依赖版本。发布 job 已在工作流中显式申请 `contents: write`，用于创建 GitHub Release。
+CI 本身无需 secrets；`Cargo.lock` 已锁定依赖版本。发布 job 已在工作流中显式申请 `contents: write`，用于创建 GitHub Release。可选配置仓库 secret `VT_API_KEY`（VirusTotal API key）以启用发布包的 VirusTotal 扫描；未配置时会跳过扫描及 release notes 中的扫描链接。
 
 ### 发布 Release
 
@@ -415,6 +415,9 @@ i32  signatureLength + signature        (omitted for SESSION_MESSAGE)
 4. 生成 `SHA256SUMS.txt`。
 5. 创建 GitHub Release，上传全部包和校验和，并自动生成 release notes。
    带 `-` 的版本 tag（如 `v0.2.0-rc.1`）会标记为 pre-release。
+6. 如果配置了 `VT_API_KEY`，将 `dist/` 中的发布包提交 VirusTotal 扫描，并在 release notes 末尾追加每个包的 SHA-256 与 VirusTotal 报告链接（重复发布会替换这一节，不会重复追加；扫描失败不会阻塞发布）。
+
+VirusTotal 扫描需要在 GitHub 仓库 **Settings → Secrets and variables → Actions** 中添加 secret `VT_API_KEY`；未配置时发布流程不会调用 VirusTotal。
 
 发布示例：
 

@@ -193,6 +193,8 @@ jobs:
     permissions:
       actions: read
       contents: write
+    env:
+      VT_API_KEY: ${{ secrets.VT_API_KEY }}
 
     steps:
       - name: Download release packages
@@ -234,3 +236,43 @@ jobs:
             echo
             gh release view "$RELEASE_TAG" --json url -q .url
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: VirusTotal scan
+        if: ${{ env.VT_API_KEY != '' }}
+        continue-on-error: true
+        uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          files: |
+            dist/k04m-log-parser-*
+
+      - name: Append VirusTotal links to release notes
+        if: ${{ env.VT_API_KEY != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          section="${RUNNER_TEMP}/virustotal-section.md"
+          body_file="${RUNNER_TEMP}/release-body.md"
+
+          {
+            echo "<!-- virustotal-links -->"
+            echo
+            echo "## VirusTotal"
+            echo
+            echo "| Artifact | SHA-256 | Scan |"
+            echo "| :--- | :--- | :--- |"
+            while read -r sha name; do
+              [[ "$name" == k04m-log-parser-* ]] || continue
+              echo "| \`$name\` | \`$sha\` | [VirusTotal](https://www.virustotal.com/gui/file/$sha) |"
+            done < dist/SHA256SUMS.txt
+          } > "$section"
+
+          body="$(gh release view "$RELEASE_TAG" --json body -q .body)"
+          # Drop a section appended by a previous run so reruns stay idempotent.
+          body="${body%%<!-- virustotal-links -->*}"
+          printf '%s\n\n' "$body" > "$body_file"
+          cat "$section" >> "$body_file"
+          gh release edit "$RELEASE_TAG" --notes-file "$body_file"
