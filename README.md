@@ -1,7 +1,11 @@
 # K04M 日志解析器
 
 > [!WARNING]
-> 先别运行v0.3.0 Release，尤其是linux，我正在排查
+> 先别运行v0.3.0 Release，尤其是linux，我正在排查。这个版本VT Linux **二进制文件报毒**了！就像我下面警告的那样，先不要运行。
+> 
+> 先别运行v0.3.0 Release，尤其是linux，我正在排查。这个版本VT Linux **二进制文件报毒**了！就像我下面警告的那样，先不要运行。
+> 
+> 先别运行v0.3.0 Release，尤其是linux，我正在排查。这个版本VT Linux **二进制文件报毒**了！就像我下面警告的那样，先不要运行。 
 
 一个用于 Minecraft 服务端日志与抓包的 **Krypt04Mcg** 分片重组、二进制包结构查看、**私钥解密**、**签名验证**与 JSON 导出工具。GUI 使用 Rust + egui，支持 `.log`、`.log.gz`、`.pcap` 与 `.pcapng`。
 
