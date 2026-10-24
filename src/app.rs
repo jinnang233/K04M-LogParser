@@ -138,7 +138,7 @@ impl K04MApp {
             show_keys: false,
             show_capture: false,
         };
-        app.apply_theme(&cc.egui_ctx);
+        Self::apply_theme(&cc.egui_ctx, app.dark);
         if !initial_keys.is_empty() {
             app.load_keys(initial_keys);
             app.show_keys = false;
@@ -149,13 +149,23 @@ impl K04MApp {
         app
     }
 
-    fn apply_theme(&self, ctx: &egui::Context) {
-        let mut visuals = if self.dark {
+    fn apply_theme(ctx: &egui::Context, dark: bool) {
+        // Pin the theme instead of following the OS preference: egui only learns
+        // the system theme after the first frame, so on Windows the active style
+        // could switch to the unthemed light style while the app still draws
+        // dark backgrounds, mixing light and dark widgets.
+        let theme = if dark {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        };
+        ctx.set_theme(theme);
+        let mut visuals = if dark {
             egui::Visuals::dark()
         } else {
             egui::Visuals::light()
         };
-        if self.dark {
+        if dark {
             visuals.panel_fill = Color32::from_rgb(20, 23, 29);
             visuals.window_fill = Color32::from_rgb(24, 28, 35);
             visuals.extreme_bg_color = Color32::from_rgb(13, 16, 21);
@@ -176,7 +186,7 @@ impl K04MApp {
         visuals.selection.bg_fill = ACCENT.gamma_multiply(0.45);
         visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
         visuals.hyperlink_color = ACCENT;
-        let mut style = (*ctx.style()).clone();
+        let mut style = (*ctx.style_of(theme)).clone();
         style.visuals = visuals;
         style.spacing.item_spacing = Vec2::new(8.0, 6.0);
         style.spacing.button_padding = Vec2::new(9.0, 5.0);
@@ -192,7 +202,7 @@ impl K04MApp {
             TextStyle::Monospace,
             FontId::new(13.5, FontFamily::Monospace),
         );
-        ctx.set_style(style);
+        ctx.set_style_of(theme, style);
     }
 
     fn load(&mut self, paths: Vec<PathBuf>) {
@@ -818,7 +828,7 @@ impl K04MApp {
         }
         if toggle_theme {
             self.dark = !self.dark;
-            self.apply_theme(ctx);
+            Self::apply_theme(ctx, self.dark);
         }
         if open_keys {
             self.show_keys = true;
@@ -3355,7 +3365,8 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     result
 }
 
-fn install_fonts(ctx: &egui::Context) {
+fn font_definitions() -> FontDefinitions {
+    let mut fonts = FontDefinitions::default();
     let candidates = [
         "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -3371,7 +3382,6 @@ fn install_fonts(ctx: &egui::Context) {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
-        let mut fonts = FontDefinitions::default();
         fonts.font_data.insert(
             "cjk_fallback".to_owned(),
             Arc::new(FontData::from_owned(bytes)),
@@ -3383,9 +3393,22 @@ fn install_fonts(ctx: &egui::Context) {
                 .or_default()
                 .push("cjk_fallback".to_owned());
         }
-        ctx.set_fonts(fonts);
-        return;
+        break;
     }
+    // The bundled Hack font covers arrows such as "→", which neither the
+    // default proportional font nor several CJK fallback fonts (e.g. Droid
+    // Sans Fallback) contain; without it arrows render as tofu boxes in the
+    // capture details.
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .push("Hack".to_owned());
+    fonts
+}
+
+fn install_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(font_definitions());
 }
 
 #[cfg(test)]
@@ -3466,5 +3489,40 @@ mod tests {
         assert_eq!(message.unique_fragments(), 1);
         assert_eq!(message.slots[&0].payload, "AA");
         assert!(message.signature.is_some());
+    }
+
+    #[test]
+    fn theme_ignores_system_preference_and_applies_to_selected_theme() {
+        let ctx = egui::Context::default();
+        // Simulate egui starting from a theme other than the app's choice.
+        ctx.set_theme(egui::Theme::Light);
+        K04MApp::apply_theme(&ctx, true);
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+        assert!(ctx.style().visuals.dark_mode);
+        assert_eq!(
+            ctx.style().visuals.panel_fill,
+            Color32::from_rgb(20, 23, 29)
+        );
+
+        K04MApp::apply_theme(&ctx, false);
+        assert_eq!(ctx.theme(), egui::Theme::Light);
+        assert!(!ctx.style().visuals.dark_mode);
+        assert_eq!(
+            ctx.style().visuals.panel_fill,
+            Color32::from_rgb(244, 246, 249)
+        );
+    }
+
+    #[test]
+    fn proportional_font_has_arrow_glyph() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(font_definitions());
+        let mut has_arrow = false;
+        let _ = ctx.run(Default::default(), |ctx| {
+            ctx.fonts(|fonts| {
+                has_arrow = fonts.has_glyph(&FontId::proportional(14.0), '→');
+            });
+        });
+        assert!(has_arrow);
     }
 }
