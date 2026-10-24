@@ -2,8 +2,8 @@
 name = "k04m-log-parser"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
-description = "Krypt04Mcg Minecraft log fragment reassembler, packet viewer, private-key decryptor, and JSON exporter"
+rust-version = "1.89"
+description = "Krypt04Mcg Minecraft log/capture parser, packet viewer, private-key and stream decryptor, and JSON exporter"
 license = "Unlicense"
 
 [dependencies]
@@ -14,12 +14,18 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 eframe = { version = "0.32.3", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 flate2 = "1"
 hkdf = "0.13"
+hmac = "0.13"
+mc_protocol = { version = "2.4", default-features = false, features = ["compression"] }
+# 4.2.0+26.3: Minecraft 26.3 / protocol 777 packet identifiers.
+minecraft_data = "=4.2.0"
 ml-kem = "0.3"
 rfd = { version = "0.15.4", default-features = false, features = ["xdg-portal", "async-std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 sha3 = "0.12"
+tcpstreams = "0.1.3"
+uuid = "1"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 x448 = "0.6"
 

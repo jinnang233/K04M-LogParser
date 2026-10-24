@@ -25,67 +25,83 @@ pub struct WireFragment {
 /// unrelated. `Some(Err(_))` means it looks like a fragment but is malformed.
 pub fn parse_fragment_line(line: &str) -> Option<Result<WireFragment, String>> {
     let prefix_start = line.find(PREFIX)?;
-    let after_prefix = &line[prefix_start + PREFIX.len()..];
-    let body = after_prefix.strip_prefix(' ').unwrap_or(after_prefix);
+    let mut fragment = match parse_fragment_text(&line[prefix_start..]) {
+        Ok(fragment) => fragment,
+        Err(reason) => return Some(Err(reason)),
+    };
+
+    fragment.line_time = line
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(time, _)| time.trim().to_owned())
+        .unwrap_or_default();
+    fragment.transport_sender = sender_before(line, prefix_start);
+    Some(Ok(fragment))
+}
+
+/// Parses the fragment text carried by the `krypt04mcg:chat_fragment` payload
+/// channel. Unlike a log line it has no Minecraft timestamp or sender prefix,
+/// and the `[KRYPT04MCG]` prefix is optional for compatibility with configured
+/// prefixes.
+pub fn parse_fragment_text(text: &str) -> Result<WireFragment, String> {
+    let text = text.trim();
+    let body = text
+        .strip_prefix(PREFIX)
+        .map(|rest| rest.strip_prefix(' ').unwrap_or(rest))
+        .unwrap_or(text);
 
     let mut parts = body.split_ascii_whitespace();
     let Some(message_id) = parts.next() else {
-        return Some(Err("前缀后缺少消息 ID".to_owned()));
+        return Err("前缀后缺少消息 ID".to_owned());
     };
     let Some(index) = parts.next() else {
-        return Some(Err("分片缺少索引".to_owned()));
+        return Err("分片缺少索引".to_owned());
     };
     let Some(total) = parts.next() else {
-        return Some(Err("分片缺少总数".to_owned()));
+        return Err("分片缺少总数".to_owned());
     };
     let Some(payload) = parts.next() else {
-        return Some(Err("分片缺少 Base64URL 载荷".to_owned()));
+        return Err("分片缺少 Base64URL 载荷".to_owned());
     };
     if parts.next().is_some() {
-        return Some(Err("分片载荷后存在多余字段".to_owned()));
+        return Err("分片载荷后存在多余字段".to_owned());
     }
 
     if message_id.len() != 32 || !message_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Some(Err(format!("消息 ID 必须是 32 位十六进制：{message_id:?}")));
+        return Err(format!("消息 ID 必须是 32 位十六进制：{message_id:?}"));
     }
     let Ok(index) = index.parse::<usize>() else {
-        return Some(Err(format!("分片索引不是十进制整数：{index:?}")));
+        return Err(format!("分片索引不是十进制整数：{index:?}"));
     };
     let Ok(total) = total.parse::<usize>() else {
-        return Some(Err(format!("分片总数不是十进制整数：{total:?}")));
+        return Err(format!("分片总数不是十进制整数：{total:?}"));
     };
     if total == 0 || total > MAX_FRAGMENTS {
-        return Some(Err(format!(
+        return Err(format!(
             "分片总数必须在 1..={MAX_FRAGMENTS} 之间，实际为 {total}"
-        )));
+        ));
     }
     if index >= total {
-        return Some(Err(format!("分片索引越界：{index}/{total}")));
+        return Err(format!("分片索引越界：{index}/{total}"));
     }
     if !payload
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
     {
-        return Some(Err("分片载荷包含非 Base64URL 字符".to_owned()));
+        return Err("分片载荷包含非 Base64URL 字符".to_owned());
     }
     if payload.len() > MAX_ENCODED_PACKET_CHARS {
-        return Some(Err("分片载荷超过协议编码上限".to_owned()));
+        return Err("分片载荷超过协议编码上限".to_owned());
     }
 
-    let line_time = line
-        .strip_prefix('[')
-        .and_then(|rest| rest.split_once(']'))
-        .map(|(time, _)| time.trim().to_owned())
-        .unwrap_or_default();
-
-    Some(Ok(WireFragment {
-        line_time,
-        transport_sender: sender_before(line, prefix_start),
+    Ok(WireFragment {
+        line_time: String::new(),
+        transport_sender: String::new(),
         message_id: message_id.to_ascii_lowercase(),
         index,
         total,
         payload: payload.to_owned(),
-    }))
+    })
 }
 
 fn sender_before(line: &str, prefix_start: usize) -> String {
@@ -370,6 +386,20 @@ mod tests {
         assert_eq!(parsed.index, 0);
         assert_eq!(parsed.total, 10);
         assert_eq!(parsed.line_time, "23:18:08");
+    }
+
+    #[test]
+    fn parses_channel_fragment_text_without_log_context() {
+        let parsed = parse_fragment_text(
+            "[KRYPT04MCG] 9F0EE31E296A77EB87FD73A3E8CCEDEB 3 10 Q6QP0OL4JhnGH5",
+        )
+        .unwrap();
+        assert_eq!(parsed.message_id, "9f0ee31e296a77eb87fd73a3e8ccedeb");
+        assert_eq!(parsed.index, 3);
+        assert_eq!(parsed.total, 10);
+        assert_eq!(parsed.payload, "Q6QP0OL4JhnGH5");
+        assert!(parsed.line_time.is_empty());
+        assert!(parsed.transport_sender.is_empty());
     }
 
     #[test]

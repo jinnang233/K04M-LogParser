@@ -1701,12 +1701,17 @@ dependencies = [
  "eframe",
  "flate2",
  "hkdf",
+ "hmac",
+ "mc_protocol",
+ "minecraft_data",
  "ml-kem",
  "rfd",
  "serde",
  "serde_json",
  "sha2",
  "sha3",
+ "tcpstreams",
+ "uuid",
  "windows-sys 0.61.2",
  "x25519-dalek",
  "x448",
@@ -1812,6 +1817,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "mc_protocol"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "242340ed87d95fd4fc2ad076ce4f44c6a40274602bd2165b6b090d7504045f33"
+dependencies = [
+ "flate2",
+ "mc_protocol_derive",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "mc_protocol_derive"
+version = "2.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3fbd1e6ef67f84a741d8a34e6abd4426f6e76b15a0df0bb5d7faeff10be177"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1833,6 +1861,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "minecraft_data"
+version = "4.2.0+26.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95cf8f20649e447dcee7b63a5bc45f58fc4ddd70b5e6b847ac80f214b99c16e2"
+dependencies = [
+ "mser",
+ "nested",
 ]
 
 [[package]]
@@ -1892,6 +1930,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mser"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98e2d8d79be0b0e9a3a2e75003138c01f0206c8c048d7eada6eaa0214630b357"
+dependencies = [
+ "uuid",
+]
+
+[[package]]
 name = "naga"
 version = "25.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1944,6 +1991,12 @@ checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
 ]
+
+[[package]]
+name = "nested"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca2b420f638f07fe83056b55ea190bb815f609ec5a35e7017884a10f78839c9e"
 
 [[package]]
 name = "nohash-hasher"
@@ -3017,6 +3070,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "tcpstreams"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df60c4fb2448c82e750429f6c857c36bfe2030ef316ab581b19ab13fd4cf9a2c"
+dependencies = [
+ "memmap2",
 ]
 
 [[package]]

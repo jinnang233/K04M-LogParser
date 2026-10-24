@@ -34,10 +34,16 @@
   - `SESSION_MESSAGE` 使用加载的会话密钥按 `sessionId` 解密；会话交换请求可用长期私钥解密，响应因使用一次性临时 KEM 公钥通常无法从日志解密。
 - 明文展示：UTF-8 文本直接显示，JSON 载荷格式化显示；可一键复制明文/JSON。
 - 一键导出**全部消息**为 JSON，包含字段树、字段偏移、分片来源、原始二进制（Base64URL 与十六进制）、解密状态与明文。
+- **PCAP/PCAPNG 抓包分析**：使用 `tcpstreams` 重组 TCP、`mc_protocol` 解析 Minecraft 帧、`minecraft_data` 提供 Minecraft 26.3（协议 777）数据包 ID，提取并解析 Krypt04Mcg 的全部通道：
+  - `krypt04mcg:chat_fragment`：加密聊天分片，跨两个方向合并重组并按 `PacketCodec` 解析/解密。
+  - `krypt04mcg:public_key`：公钥 KeyShare 分片（`uuid:index:total:data`）重组为身份 JSON。
+  - `krypt04mcg_stream:control`：流分配、会话交换、READY/END/RESET/ABORT，校验 HMAC-SHA256。
+  - `krypt04mcg_stream:data/0` … `data/255`：按流方向派生 XChaCha20-Poly1305 密钥，逐条认证解密并重组业务字节流。
+  - `krypt04mcg:tunnel`：旧版隧道信封结构解析。
 
 ## 构建与运行
 
-需要稳定版 Rust（1.88+）：
+需要稳定版 Rust（1.89+）：
 
 ```bash
 cargo test
@@ -71,11 +77,30 @@ cargo build --release
 ./target/release/k04m-log-parser --key /path/to/account --export parsed.json /path/to/logs
 ```
 
+分析 pcap/pcapng 抓包：
+
+```bash
+# 位置参数中的 .pcap/.pcapng 会自动识别
+./target/release/k04m-log-parser --key /path/to/account --export capture.json capture.pcapng
+
+# 也可以显式使用 --pcap，并可重复
+./target/release/k04m-log-parser --pcap capture.pcapng --export capture.json
+
+# 提取所有已解密的 API 流方向到目录
+./target/release/k04m-log-parser --pcap capture.pcapng \
+    --key /path/to/account --extract-streams extracted-streams
+```
+
 其他参数：
 
 ```text
 --key <路径>     加载私钥/会话密钥，可重复；支持 LocalKeyMaterial、
-                  sessions 文件/目录、账户目录或包含多个账户的父目录
+                  sessions 与 stream-api/sessions 文件/目录、账户目录或
+                  包含多个账户的父目录
+--pcap <路径>    分析 pcap/pcapng 抓包，可重复；位置参数中的 .pcap/.pcapng
+                  也会自动识别
+--extract-streams <目录>
+                  把已解密的 API 流方向写入目录
 --export <路径>  解析后导出 JSON，不启动图形界面
 -h, --help      显示帮助
 -V, --version   显示版本
@@ -92,6 +117,59 @@ GUI 快捷方式：
 | `Ctrl+K` | 打开私钥/会话密钥窗口 |
 
 也可以把文件或文件夹直接拖入窗口。
+
+## PCAP/PCAPNG 抓包分析
+
+抓包分析走命令行（GUI 仍以日志模式为主）。它从 pcap/pcapng 中重组 TCP 会话，解析 Minecraft 26.3 / 协议 777 的握手、登录、配置与 Play 阶段，并提取 Krypt04Mcg 通道。
+
+### 支持的通道
+
+| 通道 | 方向 | 解析内容 |
+| --- | --- | --- |
+| `krypt04mcg:chat_fragment` | C2S/S2C | `peer`、`fragment`、`version`；分片文本按 `[KRYPT04MCG] <id> <index> <total> <payload>` 重组 |
+| `krypt04mcg:public_key` | C2S/S2C | 公钥身份分片；按 `uuid:index:total:data` 重组并解析身份 JSON |
+| `krypt04mcg_stream:control` | C2S/S2C | `EXCHANGE`、`OPEN`、`ASSIGNED`、`READY`、`END`、`RESET`、`ABORT`；HMAC-SHA256 校验 |
+| `krypt04mcg_stream:data/0` … `data/255` | C2S/S2C | XChaCha20-Poly1305 记录；按槽位绑定、方向密钥与隐式计数器解密 |
+| `krypt04mcg:tunnel` | C2S/S2C | `peer` + 信封（流 UUID、lease、内层 Krypt04Mcg 包） |
+
+Minecraft 帧解析完全交给 `mc_protocol`（VarInt、字符串、压缩帧），数据包 ID 来自 `minecraft_data` 的 26.3 数据，而不是在本项目中硬编码。
+
+### API 流与业务通道
+
+`krypt04mcg_stream:control` 的 `OPEN`/`ASSIGNED`/`READY` 会把一个流绑定到客户端的某个 `data/N` 槽位。槽位在本地半关闭后仍会保留到对端 `END`，因此单向关闭之后仍在途的数据也能解密。每条流记录使用：
+
+- HKDF-SHA256：`IKM = stream-api 会话 secret`，`salt = sessionId`，`info = krypt04mcg_stream/v1/data/<sessionId>/<streamUuid>/<slot>/<channel>/<source>/<target>`
+- XChaCha20-Poly1305：`nonce = streamUuid(16B) || counter(8B BE)`，`AAD = krypt04mcg_stream/v1/<sessionId>/<streamUuid>/<slot>/<channel>`
+- 每个方向独立从 0 开始计数；认证失败后停止该方向的后续解密并报告。
+
+业务通道是应用自定义的不透明字节流。内置文件共享使用 `krypt04mcg_file:stream`（Java `writeUTF(name)` + `writeInt(size)` + 文件内容）；其他通道按 UTF-8/JSON/二进制自动识别，并计算 SHA-256。`--extract-streams` 会写出每个已解密流方向的完整字节。
+
+### 密钥来源
+
+- 聊天包/会话交换：`<account>/keys/private/local.json` 与 `<account>/sessions/*.json`。
+- 原始加密流：`<account>/stream-api/sessions/*.json`（使用 `<account>/stream-api/secrets/master.key` 解密）。
+- `--key` 指向账户目录时会同时加载这两套会话；也可以直接指向 `stream-api` 目录。
+
+### 输出
+
+`--export capture.json` 生成：
+
+- `summary`：抓包、TCP 会话、Minecraft 连接、通道消息、聊天重组、公钥共享、API 流、流记录与明文字节统计。
+- `connections`：每个 Minecraft 连接的玩家、协议版本、brand、压缩阈值、已注册通道。
+- `events`：`chat_fragment`、`public_key`、`control`、`tunnel` 以及无法绑定/识别的通道消息，含时间、方向、连接、帧偏移和解析结果。
+- `chat_transfers`：跨两个方向合并后的加密聊天消息、分片来源、`PacketCodec` 字段树与解密结果。
+- `public_key_shares`：公钥 KeyShare 重组状态与身份摘要。
+- `api_streams`：按流 UUID 合并的 API 流；每个方向包含记录索引、密文/明文长度、解密状态、内容类型、SHA-256、预览/JSON/Base64。完整解密字节只在内存中保留（`CaptureOptions::retain_stream_data`），可由 `--extract-streams` 写出，不写入 JSON。
+- `warnings`：协议版本不匹配、HMAC 失败、缺失记录、未绑定槽位等。
+
+### 限制
+
+- 只支持未启用 Minecraft 协议加密（online-mode 的 AES 流）的抓包；本工具不实现 Minecraft 的登录加密。
+- 需要抓包包含 Minecraft 握手/登录阶段，才能可靠确定协议状态、压缩阈值与玩家名；从中途开始的抓包可能只能提取服务端通道消息。
+- `tcpstreams` 按四元组合并会话；同一抓包中复用相同端口的多条连接会被视为同一会话。IP 分片会被跳过。
+- 流记录没有显式序号；抓包丢失或乱序会导致该方向后续记录认证失败。
+- 签名不做验证；解密成功只证明密文与加载的密钥匹配。
+- 协议版本以 Minecraft 26.3（777）的数据包 ID 表为准；其他版本会给出警告，但可能无法正确识别数据包。
 
 ## 界面说明
 
