@@ -32,6 +32,69 @@ const TUNNEL_TIMESTAMP: i64 = 1_234;
 const TUNNEL_BODY: &[u8] = b"tunnel hello";
 
 #[test]
+fn verifies_capture_chat_signature_from_public_key_share() {
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("../../tests/data/signature-vectors.json")).unwrap();
+    let case = vectors["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"] == "composite_mldsa65_ed25519")
+        .expect("signed vector");
+    let signed_packet = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(case["packet_base64url"].as_str().unwrap())
+        .unwrap();
+    let identity = serde_json::to_string(&case["sender_identity"]).unwrap();
+    let key_share = format!("aaaabbbb-cccc-dddd-eeee-ffff00001111:0:1:{identity}");
+
+    let dir = temp_root("signature");
+    let pcap_path = dir.join("signed.pcapng");
+    fs::write(
+        &pcap_path,
+        build_pcapng(&fixture_packets_with(&signed_packet, &key_share)),
+    )
+    .unwrap();
+    let store = KeyStore::default();
+    let analysis = analyze_captures(
+        &[pcap_path],
+        &store,
+        &CaptureOptions {
+            retain_stream_data: false,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(analysis.chat_transfers.len(), 1);
+    let signature = analysis.chat_transfers[0]
+        .signature
+        .as_ref()
+        .expect("signature outcome");
+    assert_eq!(
+        signature.status,
+        crate::model::SignatureStatus::Verified,
+        "{signature:?}"
+    );
+    assert_eq!(signature.key_owner.as_deref(), Some("alice"));
+    assert!(analysis.cryptographic_verification);
+    assert_eq!(analysis.summary.signatures_verified, 1);
+
+    let export_path = dir.join("signed.json");
+    super::export_capture_json(&export_path, &analysis).unwrap();
+    let exported: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&export_path).unwrap()).unwrap();
+    assert_eq!(exported["cryptographic_verification"], true);
+    assert_eq!(exported["summary"]["signatures_verified"], 1);
+    assert_eq!(
+        exported["chat_transfers"][0]["signature"]["status"],
+        "verified"
+    );
+    assert_eq!(
+        exported["chat_transfers"][0]["signature"]["key_owner"],
+        "alice"
+    );
+}
+
+#[test]
 fn analyzes_synthetic_capture_channels() {
     let dir = temp_root("channels");
     let pcap_path = dir.join("fixture.pcapng");
@@ -186,6 +249,10 @@ fn session_store() -> KeyStore {
 }
 
 fn fixture_packets() -> Vec<Vec<u8>> {
+    fixture_packets_with(&sample_packet(), &key_share_chunk())
+}
+
+fn fixture_packets_with(chat_packet: &[u8], key_share: &str) -> Vec<Vec<u8>> {
     let mut packets = Vec::new();
     let mut client_seq = CLIENT_SEQ;
     let mut server_seq = SERVER_SEQ;
@@ -338,7 +405,7 @@ fn fixture_packets() -> Vec<Vec<u8>> {
     let mut ordered: Vec<(Side, Vec<u8>)> = ordered.into_iter().collect();
 
     // Chat fragments are sent in both directions for the same message.
-    let fragments = chat_fragments();
+    let fragments = chat_fragments(chat_packet);
     for fragment in &fragments {
         ordered.push((
             Side::ClientToServer,
@@ -366,7 +433,7 @@ fn fixture_packets() -> Vec<Vec<u8>> {
         play_custom_payload(
             Side::ClientToServer,
             "krypt04mcg:public_key",
-            &peer_fragment_payload(BOB, &key_share_chunk()),
+            &peer_fragment_payload(BOB, key_share),
         ),
     ));
 
@@ -536,9 +603,8 @@ fn peer_fragment_payload(peer: &str, fragment: &str) -> Vec<u8> {
     payload
 }
 
-fn chat_fragments() -> Vec<String> {
-    let packet = sample_packet();
-    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&packet);
+fn chat_fragments(packet: &[u8]) -> Vec<String> {
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(packet);
     let chunk_size = 200;
     let total = encoded.len().div_ceil(chunk_size);
     (0..total)

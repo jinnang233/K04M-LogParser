@@ -6,8 +6,75 @@ use std::path::{Path, PathBuf};
 
 use chrono::{Local, NaiveDate};
 
+use crate::capture::is_capture_extension;
 use crate::fragment::{GroupAccumulator, PREFIX, parse_fragment_line};
 use crate::model::{FragmentOccurrence, LoadedLogs, LogTimestamp, SourceInfo};
+
+/// Log and capture files discovered below the paths selected in the GUI.
+#[derive(Clone, Debug, Default)]
+pub struct DiscoveredInputs {
+    pub logs: Vec<PathBuf>,
+    pub captures: Vec<PathBuf>,
+}
+
+/// Classifies explicit files and recursively scans directories. Explicit
+/// files are logs unless their extension is `.pcap`/`.pcapng`; directories
+/// only contribute `.log`, `.log.gz`, `.pcap` and `.pcapng` files.
+pub fn discover_inputs(
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<DiscoveredInputs, String> {
+    let mut inputs = DiscoveredInputs::default();
+    for path in paths {
+        collect_input(&path, &mut inputs, 0)?;
+    }
+    inputs.logs.sort();
+    inputs.logs.dedup();
+    inputs.captures.sort();
+    inputs.captures.dedup();
+    Ok(inputs)
+}
+
+fn collect_input(path: &Path, inputs: &mut DiscoveredInputs, depth: usize) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("无法读取路径 {}：{error}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_file() {
+        if is_capture_extension(path) {
+            inputs.captures.push(path.to_path_buf());
+        } else {
+            inputs.logs.push(path.to_path_buf());
+        }
+        return Ok(());
+    }
+    if !metadata.is_dir() || depth >= 8 {
+        return Ok(());
+    }
+    let entries =
+        fs::read_dir(path).map_err(|error| format!("无法读取目录 {}：{error}", path.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("读取 {} 的目录项失败：{error}", path.display()))?;
+        let child = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("读取 {} 的类型失败：{error}", child.display()))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_input(&child, inputs, depth + 1)?;
+        } else if file_type.is_file() {
+            if is_log_name(&child) {
+                inputs.logs.push(child);
+            } else if is_capture_extension(&child) {
+                inputs.captures.push(child);
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Loads explicit files or recursively discovers logs below directories.
 pub fn load_paths(paths: impl IntoIterator<Item = PathBuf>) -> Result<LoadedLogs, String> {
@@ -261,5 +328,31 @@ mod tests {
     fn infers_date_from_rotated_name() {
         let path = Path::new("/tmp/2026-10-21-4.log.gz");
         assert_eq!(infer_source_date(path).as_deref(), Some("2026-10-21"));
+    }
+
+    #[test]
+    fn classifies_logs_and_captures_for_the_gui() {
+        let dir = temp_dir("classify");
+        fs::write(dir.join("latest.log"), "").unwrap();
+        fs::write(dir.join("old.log.gz"), "").unwrap();
+        fs::write(dir.join("traffic.pcap"), "").unwrap();
+        fs::write(dir.join("traffic.pcapng"), "").unwrap();
+        fs::write(dir.join("keys.json"), "").unwrap();
+
+        let discovered = discover_inputs([dir.clone()]).unwrap();
+        assert_eq!(discovered.logs.len(), 2);
+        assert_eq!(discovered.captures.len(), 2);
+        assert!(
+            discovered
+                .logs
+                .iter()
+                .all(|path| path.extension().is_some_and(|ext| ext != "json"))
+        );
+
+        let explicit = discover_inputs([dir.join("traffic.pcapng")]).unwrap();
+        assert!(explicit.logs.is_empty());
+        assert_eq!(explicit.captures.len(), 1);
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

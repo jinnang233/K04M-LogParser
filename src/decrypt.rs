@@ -9,10 +9,11 @@
 //! * AEAD: AES-256-GCM and ChaCha20-Poly1305.
 //! * KDF: HKDF-SHA256 with the project's domain labels.
 //!
-//! Signature verification is intentionally not performed: it would require the
-//! post-quantum signature public keys and is unrelated to recovering plaintext.
-//! A successful decryption authenticates the ciphertext under the loaded key but
-//! does not prove the claimed sender identity.
+//! Private keys, session secrets and public signature keys are loaded here.
+//! Signature verification itself lives in [`crate::signature`]; it is
+//! independent of decryption. A successful decryption authenticates the
+//! ciphertext under the loaded key but does not by itself prove the claimed
+//! sender identity.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,9 +33,10 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSec
 
 use crate::model::{
     DecryptionAttempt, DecryptionOutcome, DecryptionStatus, FragmentGroup, LoadedLogs,
-    MessageStatus, ParsedPacket,
+    MessageStatus, ParsedPacket, SignatureOutcome,
 };
 use crate::packet::{FLAG_COMPRESSED, FLAG_SESSION_RESPONSE, FLAG_SIGNED, hex};
+use crate::signature::SignatureKeyRegistry;
 
 const HYBRID_MAGIC: u32 = 0x4b30_3401;
 const HYBRID_MAX_COMPONENT: usize = 2 * 1024 * 1024;
@@ -63,6 +65,8 @@ const COMPOSITE_1024_X448_LABEL: &[u8] = b"MLKEM1024-X448";
 pub struct KeyStore {
     pub private_keys: Vec<PrivateKeyEntry>,
     pub sessions: Vec<SessionEntry>,
+    /// Public signature keys used to verify signed packet envelopes.
+    pub signatures: SignatureKeyRegistry,
     pub sources: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -94,6 +98,7 @@ pub struct KeyLoadSummary {
     pub files_scanned: usize,
     pub keys_added: usize,
     pub sessions_added: usize,
+    pub public_keys_added: usize,
     pub duplicate_keys: usize,
     pub duplicate_sessions: usize,
     pub warnings: Vec<String>,
@@ -102,8 +107,8 @@ pub struct KeyLoadSummary {
 impl KeyLoadSummary {
     pub fn message(&self) -> String {
         let mut text = format!(
-            "扫描 {} 个文件，新增 {} 个私钥、{} 个会话密钥",
-            self.files_scanned, self.keys_added, self.sessions_added
+            "扫描 {} 个文件，新增 {} 个私钥、{} 个会话密钥、{} 个签名公钥",
+            self.files_scanned, self.keys_added, self.sessions_added, self.public_keys_added
         );
         if self.duplicate_keys > 0 || self.duplicate_sessions > 0 {
             text.push_str(&format!(
@@ -354,9 +359,12 @@ impl KeyStore {
         outcome
     }
 
-    /// Parses and (when matching key material is loaded) decrypts a complete
-    /// Krypt04Mcg packet envelope carried inside a stream control message.
-    pub fn analyze_packet(&self, binary: &[u8]) -> (ParsedPacket, DecryptionOutcome) {
+    /// Parses, decrypts and verifies a complete Krypt04Mcg packet envelope
+    /// carried inside a stream control message.
+    pub fn analyze_packet(
+        &self,
+        binary: &[u8],
+    ) -> (ParsedPacket, DecryptionOutcome, SignatureOutcome) {
         let packet = crate::packet::parse_packet(binary);
         let status = if packet.error.is_none() {
             MessageStatus::Parsed
@@ -378,18 +386,21 @@ impl KeyStore {
             packet: Some(packet.clone()),
             status,
             decryption: None,
+            signature: None,
         };
         let outcome = self.decrypt_message(&group);
-        (packet, outcome)
+        let signature = self.signatures.verify_packet(&packet, binary);
+        (packet, outcome, signature)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.private_keys.is_empty() && self.sessions.is_empty()
+        self.private_keys.is_empty() && self.sessions.is_empty() && self.signatures.is_empty()
     }
 
     pub fn clear(&mut self) {
         self.private_keys.clear();
         self.sessions.clear();
+        self.signatures.clear();
         self.sources.clear();
         self.warnings.clear();
     }
@@ -411,6 +422,8 @@ impl KeyStore {
             if local.is_file() {
                 self.note_source(path);
                 self.load_file(&local, summary);
+                self.load_public_dir(&path.join("keys").join("public"), summary);
+                self.load_self_public_export(path, summary);
                 self.load_sessions_dir(path, summary);
                 self.load_stream_api_dir(path, summary);
                 return;
@@ -421,6 +434,8 @@ impl KeyStore {
                 self.note_source(path);
                 self.load_file(&nested_local, summary);
                 if let Some(account_root) = path.parent() {
+                    self.load_public_dir(&path.join("public"), summary);
+                    self.load_self_public_export(account_root, summary);
                     self.load_sessions_dir(account_root, summary);
                     self.load_stream_api_dir(account_root, summary);
                 }
@@ -434,6 +449,17 @@ impl KeyStore {
                 return;
             }
 
+            // A standalone `keys/public` directory (or a `keys` directory
+            // without private material).
+            if path.join("public").is_dir() {
+                self.note_source(path);
+                self.load_public_dir(&path.join("public"), summary);
+                if path.join("private").join("local.json").is_file() {
+                    self.load_file(&path.join("private").join("local.json"), summary);
+                }
+                return;
+            }
+
             let roots = find_account_roots(path);
             if !roots.is_empty() {
                 for root in roots {
@@ -442,6 +468,8 @@ impl KeyStore {
                     if local.is_file() {
                         self.load_file(&local, summary);
                     }
+                    self.load_public_dir(&root.join("keys").join("public"), summary);
+                    self.load_self_public_export(&root, summary);
                     self.load_sessions_dir(&root, summary);
                     self.load_stream_api_dir(&root, summary);
                 }
@@ -481,6 +509,35 @@ impl KeyStore {
 
     fn load_sessions_dir(&mut self, account_root: &Path, summary: &mut KeyLoadSummary) {
         self.load_sessions_in(&account_root.join("sessions"), summary);
+    }
+
+    /// Loads `keys/public/*.json`, the public identities exchanged over the
+    /// `krypt04mcg:public_key` channel.
+    fn load_public_dir(&mut self, dir: &Path, summary: &mut KeyLoadSummary) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                candidate.is_file()
+                    && candidate
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            })
+            .collect();
+        files.sort();
+        for file in files {
+            self.load_file(&file, summary);
+        }
+    }
+
+    fn load_self_public_export(&mut self, account_root: &Path, summary: &mut KeyLoadSummary) {
+        let path = account_root.join("export").join("self-public.json");
+        if path.is_file() {
+            self.load_file(&path, summary);
+        }
     }
 
     /// Loads the separate `stream-api/sessions/` ledger used by the raw
@@ -558,12 +615,27 @@ impl KeyStore {
                 }
             }
             serde_json::Value::Object(object) => {
-                if object.contains_key("kemPrivateKey") || object.contains_key("kemPublicKey") {
+                if object.contains_key("kemPrivateKey") {
                     self.ingest_local_material(value, path, summary);
+                } else if object.contains_key("signaturePublicKey") {
+                    self.ingest_public_identity(value, path, summary);
                 } else if object.contains_key("stateVersion") || object.contains_key("session") {
                     self.ingest_session_state(value, path, summary);
                 } else if object.contains_key("keyData") {
-                    if let Ok(record) = serde_json::from_value::<KeyRecordJson>(value.clone()) {
+                    let algorithm = object
+                        .get("algorithm")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if algorithm.to_ascii_lowercase().ends_with("/public") {
+                        if self
+                            .signatures
+                            .ingest_record_value(value, &path.display().to_string())
+                        {
+                            summary.public_keys_added += 1;
+                        }
+                    } else if let Ok(record) =
+                        serde_json::from_value::<KeyRecordJson>(value.clone())
+                    {
                         self.add_key_record(&record, None, path, summary);
                     }
                 } else if object.contains_key("secret") && object.contains_key("sessionId") {
@@ -582,12 +654,32 @@ impl KeyStore {
         }
     }
 
+    fn ingest_public_identity(
+        &mut self,
+        value: &serde_json::Value,
+        path: &Path,
+        summary: &mut KeyLoadSummary,
+    ) {
+        if self
+            .signatures
+            .ingest_identity_value(value, &path.display().to_string())
+        {
+            summary.public_keys_added += 1;
+        }
+    }
+
     fn ingest_local_material(
         &mut self,
         value: &serde_json::Value,
         path: &Path,
         summary: &mut KeyLoadSummary,
     ) {
+        if self
+            .signatures
+            .ingest_identity_value(value, &path.display().to_string())
+        {
+            summary.public_keys_added += 1;
+        }
         let Some(kem_private) = value.get("kemPrivateKey") else {
             self.warn(summary, format!("{} 缺少 kemPrivateKey", path.display()));
             return;
@@ -794,10 +886,25 @@ impl KeyStore {
     // Decryption
     // -----------------------------------------------------------------------
 
-    /// Recomputes decryption for every reassembled message.
+    /// Recomputes decryption and signature verification for every reassembled
+    /// message.
     pub fn decrypt_loaded(&self, loaded: &mut LoadedLogs) {
         for message in &mut loaded.messages {
             message.decryption = Some(self.decrypt_message(message));
+            message.signature = Some(self.verify_message(message));
+        }
+    }
+
+    /// Verifies one reassembled packet signature against the loaded public
+    /// keys. Independent of payload decryption.
+    pub fn verify_message(&self, message: &FragmentGroup) -> SignatureOutcome {
+        match (&message.packet, message.binary.as_deref()) {
+            (Some(packet), Some(binary)) => self.signatures.verify_packet(packet, binary),
+            _ => SignatureOutcome {
+                status: crate::model::SignatureStatus::NotAttempted,
+                error: Some("消息不完整或缺少二进制，无法验证签名".to_owned()),
+                ..SignatureOutcome::default()
+            },
         }
     }
 
@@ -1114,7 +1221,7 @@ fn slice_field(binary: &[u8], offset: usize, length: usize) -> Result<&[u8], Str
 // AAD reconstruction (PacketCodec.aadFor)
 // ---------------------------------------------------------------------------
 
-fn build_aad(packet: &ParsedPacket) -> Result<Vec<u8>, String> {
+pub(crate) fn build_aad(packet: &ParsedPacket) -> Result<Vec<u8>, String> {
     let version = packet
         .protocol_version
         .ok_or_else(|| "缺少协议版本".to_owned())?;

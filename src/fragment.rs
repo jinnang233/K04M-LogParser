@@ -270,6 +270,7 @@ impl GroupBuilder {
             packet: None,
             status: MessageStatus::Incomplete,
             decryption: None,
+            signature: None,
         };
 
         if self.total_conflict {

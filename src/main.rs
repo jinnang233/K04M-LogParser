@@ -42,7 +42,7 @@ fn run() -> Result<(), String> {
         return Err("--extract-streams 只适用于 pcap/pcapng 输入".to_owned());
     }
 
-    if !cli.pcap_paths.is_empty() {
+    if !cli.pcap_paths.is_empty() && (cli.export.is_some() || cli.extract_streams.is_some()) {
         if !cli.paths.is_empty() {
             return Err("不能在同一次运行中混合日志与 pcap/pcapng 输入；请分别导出".to_owned());
         }
@@ -115,9 +115,25 @@ fn run() -> Result<(), String> {
             key_store.private_keys.len(),
             key_store.sessions.len()
         );
+        let signed = loaded.signed_packet_count();
+        if signed > 0 {
+            println!(
+                "签名：检查 {signed} 个已签名包，有效 {}、缺少公钥 {}、不支持 {}、无效 {}",
+                loaded.signature_count(k04m_log_parser::model::SignatureStatus::Verified),
+                loaded.signature_count(k04m_log_parser::model::SignatureStatus::NoKey),
+                loaded.signature_count(k04m_log_parser::model::SignatureStatus::Unsupported),
+                loaded.signature_count(k04m_log_parser::model::SignatureStatus::Failed),
+            );
+        }
         println!("JSON 已写入 {}", export_path.display());
         return Ok(());
     }
+
+    if !cli.pcap_paths.is_empty() && !cli.paths.is_empty() {
+        return Err("不能在同一次运行中混合日志与 pcap/pcapng 输入；请分别打开".to_owned());
+    }
+    let mut initial_paths = cli.paths;
+    initial_paths.extend(cli.pcap_paths);
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -129,7 +145,7 @@ fn run() -> Result<(), String> {
     eframe::run_native(
         "K04M 日志解析器",
         options,
-        Box::new(move |cc| Ok(Box::new(K04MApp::new(cc, cli.paths, cli.keys)))),
+        Box::new(move |cc| Ok(Box::new(K04MApp::new(cc, initial_paths, cli.keys)))),
     )
     .map_err(|error| format!("启动图形界面失败：{error}"))
 }
@@ -238,6 +254,14 @@ fn print_capture_summary(
         summary.chat_transfers_decrypted
     );
     println!(
+        "签名：已签名包 {} 个，有效 {}、缺少公钥 {}、不支持 {}、无效 {}",
+        summary.signature_packets,
+        summary.signatures_verified,
+        summary.signatures_no_key,
+        summary.signatures_unsupported,
+        summary.signatures_failed
+    );
+    println!(
         "公钥共享 {} 组，API 流 {} 条，流记录 {} 条（线上观测 {} 条，已解密 {} 条），明文 {} 字节",
         summary.public_key_shares,
         summary.api_streams,
@@ -272,21 +296,24 @@ fn print_help() {
             "  k04m-log-parser --pcap <抓包.pcapng> --extract-streams <目录> [--key <路径> ...]\n",
             "\n",
             "参数：\n",
-            "  --key <路径>     加载私钥/会话密钥；可重复。可指向 LocalKeyMaterial\n",
-            "                   (local.json)、sessions/stream-api sessions 目录、\n",
-            "                   Krypt04Mcg 账户目录或包含多个账户的父目录\n",
-            "  --pcap <路径>    分析 pcap/pcapng 抓包；可重复。位置参数中的 .pcap/.pcapng\n",
-            "                   也会自动识别\n",
+            "  --key <路径>     加载私钥/会话密钥/签名公钥；可重复。可指向\n",
+            "                   LocalKeyMaterial (local.json)、sessions/stream-api\n",
+            "                   sessions、keys/public、Krypt04Mcg 账户目录或\n",
+            "                   包含多个账户的父目录\n",
+            "  --pcap <路径>    打开 pcap/pcapng 抓包；可重复。位置参数中的 .pcap/.pcapng\n",
+            "                   也会自动识别。与 --export/--extract-streams 同时使用时\n",
+            "                   只做命令行分析，否则启动图形界面\n",
             "  --extract-streams <目录>\n",
             "                   把已解密的 API 流方向写入目录（需要匹配的 stream-api 会话密钥）\n",
             "  --export <路径>  解析后导出 JSON，不启动图形界面\n",
             "  -h, --help      显示帮助\n",
             "  -V, --version   显示版本\n",
             "\n",
-            "图形界面支持 .log 和 .log.gz，可打开文件或递归扫描 logs 文件夹。\n",
-            "pcap/pcapng 分析走命令行，支持 Minecraft 26.3（协议 777）的\n",
-            "krypt04mcg:chat_fragment、krypt04mcg:public_key、krypt04mcg:tunnel、\n",
-            "krypt04mcg_stream:control 与 krypt04mcg_stream:data/* 通道。",
+            "图形界面支持 .log/.log.gz 与 .pcap/.pcapng，可打开文件或递归扫描文件夹。\n",
+            "抓包分析支持 Minecraft 26.3（协议 777）的 krypt04mcg:chat_fragment、\n",
+            "krypt04mcg:public_key、krypt04mcg:tunnel、krypt04mcg_stream:control 与\n",
+            "krypt04mcg_stream:data/* 通道。加载签名公钥（keys/public、local.json 或\n",
+            "抓包公钥共享）后会自动验证包签名。",
         ),
         env!("CARGO_PKG_VERSION")
     );

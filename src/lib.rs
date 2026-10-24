@@ -8,3 +8,4 @@ pub mod fragment;
 pub mod log_reader;
 pub mod model;
 pub mod packet;
+pub mod signature;

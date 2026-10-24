@@ -50,6 +50,7 @@ fn message_from_base64(packet_base64: &str) -> FragmentGroup {
         packet: Some(packet),
         status: MessageStatus::Parsed,
         decryption: None,
+        signature: None,
     }
 }
 
@@ -241,6 +242,7 @@ fn incomplete_messages_are_not_attempted() {
         packet: None,
         status: MessageStatus::Incomplete,
         decryption: None,
+        signature: None,
     };
     let outcome = store.decrypt_message(&message);
     assert_eq!(

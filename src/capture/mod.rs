@@ -30,7 +30,9 @@ use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
 
 use crate::decrypt::KeyStore;
-use crate::model::{DecryptionOutcome, FragmentOccurrence, MessageStatus, ParsedPacket};
+use crate::model::{
+    DecryptionOutcome, FragmentOccurrence, MessageStatus, ParsedPacket, SignatureOutcome,
+};
 
 pub use krypt::CaptureAnalysis;
 
@@ -226,6 +228,11 @@ pub enum ChannelPayload {
         packet: Option<Box<ParsedPacket>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         decryption: Option<Box<DecryptionOutcome>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<Box<SignatureOutcome>>,
+        /// Inner packet bytes retained for post-assembly signature checks.
+        #[serde(skip)]
+        packet_binary: Vec<u8>,
     },
     Unknown {
         payload_length: usize,
@@ -246,8 +253,13 @@ pub struct ControlHmac {
 pub struct ControlExchange {
     pub packet: ParsedPacket,
     pub decryption: DecryptionOutcome,
+    pub signature: SignatureOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_exchange: Option<SessionExchangeSummary>,
+    /// Inner packet bytes, retained so signature verification can run after
+    /// all public-key shares have been assembled. Never serialized.
+    #[serde(skip)]
+    pub binary: Vec<u8>,
 }
 
 /// Sanitized view of `SessionExchangePayload`. Key material and the session
@@ -310,6 +322,11 @@ pub struct ChatTransfer {
     pub packet: Option<ParsedPacket>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decryption: Option<DecryptionOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<SignatureOutcome>,
+    /// Reassembled packet bytes for the GUI hex viewer. Never serialized.
+    #[serde(skip)]
+    pub binary: Option<Vec<u8>>,
     pub fragments: Vec<FragmentOccurrence>,
 }
 
@@ -452,6 +469,11 @@ pub struct CaptureSummary {
     pub api_data_records: usize,
     pub api_data_record_observations: usize,
     pub api_data_records_decrypted: usize,
+    pub signature_packets: usize,
+    pub signatures_verified: usize,
+    pub signatures_no_key: usize,
+    pub signatures_unsupported: usize,
+    pub signatures_failed: usize,
     pub total_plaintext_bytes: u64,
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub channels: BTreeMap<String, usize>,

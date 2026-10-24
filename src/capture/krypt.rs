@@ -14,7 +14,9 @@ use uuid::Uuid;
 
 use crate::decrypt::{KeyStore, StreamKeyDirection, StreamRecordCipher};
 use crate::fragment::{GroupAccumulator, parse_fragment_text};
-use crate::model::{DecryptionOutcome, DecryptionStatus, FragmentOccurrence};
+use crate::model::{
+    DecryptionOutcome, DecryptionStatus, FragmentOccurrence, SignatureOutcome, SignatureStatus,
+};
 use crate::packet::hex_preview;
 
 use super::mc::{ParsedConnection, RawChannelMessage};
@@ -46,8 +48,8 @@ pub struct CaptureAnalysis {
     pub generated_at_local: String,
     pub minecraft_version: String,
     pub protocol_version: u32,
-    /// Signatures are not verified; a successful AEAD tag check only proves
-    /// that the ciphertext matches a loaded key.
+    /// True when at least one packet signature was verified against a loaded
+    /// public key.
     pub cryptographic_verification: bool,
     /// True when at least one chat message or stream record was authenticated
     /// and decrypted.
@@ -458,7 +460,7 @@ impl<'a> Analyzer<'a> {
         };
 
         if kind == "EXCHANGE" {
-            let (packet, mut outcome) = self.key_store.analyze_packet(&wire.body.0);
+            let (packet, mut outcome, signature) = self.key_store.analyze_packet(&wire.body.0);
             let summary = session_exchange_summary(&outcome);
             if summary
                 .as_ref()
@@ -476,7 +478,9 @@ impl<'a> Analyzer<'a> {
                 *exchange = Some(Box::new(ControlExchange {
                     packet,
                     decryption: outcome,
+                    signature,
                     session_exchange: summary,
+                    binary: wire.body.0.clone(),
                 }));
             }
             return Some(event);
@@ -618,6 +622,8 @@ impl<'a> Analyzer<'a> {
                 envelope_length: 0,
                 packet: None,
                 decryption: None,
+                signature: None,
+                packet_binary: Vec::new(),
             },
             error: None,
         };
@@ -654,6 +660,8 @@ impl<'a> Analyzer<'a> {
             envelope_length,
             packet: event_packet,
             decryption: event_decryption,
+            signature: _,
+            packet_binary,
         } = &mut event.payload
         {
             *event_peer = peer;
@@ -662,6 +670,7 @@ impl<'a> Analyzer<'a> {
             *envelope_length = envelope.len();
             *event_packet = Some(Box::new(packet));
             *event_decryption = decryption;
+            *packet_binary = envelope[24..].to_vec();
         }
         Some(event)
     }
@@ -848,6 +857,26 @@ impl<'a> Analyzer<'a> {
     }
 
     fn finish(mut self, sources: Vec<CaptureSource>) -> CaptureAnalysis {
+        // Public-key shares are assembled first so signatures on earlier chat
+        // or control traffic can still be verified by keys shared later.
+        let public_key_shares = self.key_shares.finish();
+        let mut registry = self.key_store.signatures.clone();
+        for share in &public_key_shares {
+            if !share.complete {
+                continue;
+            }
+            let Some(identity) = &share.identity else {
+                continue;
+            };
+            if !identity.owner.eq_ignore_ascii_case(&share.sender) {
+                continue;
+            }
+            if let Some(json) = &share.json {
+                let _ = registry
+                    .ingest_identity_value(json, &format!("抓包公钥共享 {}", share.transfer_id));
+            }
+        }
+
         // Chat transfers.
         let groups = std::mem::take(&mut self.chat).finish();
         let mut chat_transfers = Vec::with_capacity(groups.len());
@@ -864,6 +893,10 @@ impl<'a> Analyzer<'a> {
                 chat_transfers_decrypted += 1;
             }
             let binary = group.binary.as_deref();
+            let signature = group
+                .packet
+                .as_ref()
+                .map(|packet| registry.verify_packet(packet, binary.unwrap_or_default()));
             chat_transfers.push(ChatTransfer {
                 message_id: group.message_id.clone(),
                 sender: group.transport_sender.clone(),
@@ -881,6 +914,8 @@ impl<'a> Analyzer<'a> {
                     .map(|binary| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(binary)),
                 packet: group.packet.clone(),
                 decryption,
+                signature,
+                binary: group.binary.clone(),
                 fragments: group
                     .all_occurrences_sorted()
                     .into_iter()
@@ -889,7 +924,35 @@ impl<'a> Analyzer<'a> {
             });
         }
 
-        let public_key_shares = self.key_shares.finish();
+        // Verify signatures on packets embedded in control exchanges and
+        // legacy tunnels now that every captured public identity is known.
+        let mut signature_counts = SignatureCounts::default();
+        for transfer in &chat_transfers {
+            signature_counts.observe(transfer.signature.as_ref());
+        }
+        for event in &mut self.events {
+            match &mut event.payload {
+                ChannelPayload::Control {
+                    exchange: Some(exchange),
+                    ..
+                } => {
+                    exchange.signature = registry.verify_packet(&exchange.packet, &exchange.binary);
+                    signature_counts.observe(Some(&exchange.signature));
+                }
+                ChannelPayload::Tunnel {
+                    packet: Some(packet),
+                    signature,
+                    packet_binary,
+                    ..
+                } => {
+                    let outcome = registry.verify_packet(packet, packet_binary);
+                    signature_counts.observe(Some(&outcome));
+                    *signature = Some(Box::new(outcome));
+                }
+                _ => {}
+            }
+        }
+
         let api_streams = self.streams.finish(self.options.retain_stream_data);
 
         // Stable event order and global indices.
@@ -934,6 +997,11 @@ impl<'a> Analyzer<'a> {
             api_data_records: self.unique_data_records,
             api_data_record_observations: self.data_records,
             api_data_records_decrypted: self.decrypted_data_records,
+            signature_packets: signature_counts.packets,
+            signatures_verified: signature_counts.verified,
+            signatures_no_key: signature_counts.no_key,
+            signatures_unsupported: signature_counts.unsupported,
+            signatures_failed: signature_counts.failed,
             total_plaintext_bytes: self.total_plaintext_bytes,
             channels: std::mem::take(&mut self.channels),
             warnings: Vec::new(),
@@ -949,7 +1017,7 @@ impl<'a> Analyzer<'a> {
             generated_at_local: now_utc.with_timezone(&Local).to_rfc3339(),
             minecraft_version: minecraft_data::NAME_VERSION.to_owned(),
             protocol_version: minecraft_data::PROTOCOL_VERSION,
-            cryptographic_verification: false,
+            cryptographic_verification: signature_counts.verified > 0,
             payload_decrypted: self.decrypted_data_records > 0 || chat_transfers_decrypted > 0,
             summary,
             sources,
@@ -1007,6 +1075,42 @@ enum CipherSlot {
     Cipher(StreamRecordCipher),
     NoKey(String),
     Failed { next_index: u64 },
+}
+
+#[derive(Default)]
+struct SignatureCounts {
+    packets: usize,
+    verified: usize,
+    no_key: usize,
+    unsupported: usize,
+    failed: usize,
+}
+
+impl SignatureCounts {
+    fn observe(&mut self, outcome: Option<&SignatureOutcome>) {
+        let Some(outcome) = outcome else {
+            return;
+        };
+        match outcome.status {
+            SignatureStatus::Verified => {
+                self.packets += 1;
+                self.verified += 1;
+            }
+            SignatureStatus::NoKey => {
+                self.packets += 1;
+                self.no_key += 1;
+            }
+            SignatureStatus::Unsupported => {
+                self.packets += 1;
+                self.unsupported += 1;
+            }
+            SignatureStatus::Failed => {
+                self.packets += 1;
+                self.failed += 1;
+            }
+            SignatureStatus::NotAttempted | SignatureStatus::NotPresent => {}
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -93,6 +93,90 @@ impl DecryptionStatus {
     }
 }
 
+/// Outcome of verifying the `signature` field of a packet envelope against a
+/// loaded signature public key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureStatus {
+    /// The packet is incomplete, structurally invalid, or verification was not
+    /// attempted.
+    #[default]
+    NotAttempted,
+    /// The packet carries no signature (for example every `SESSION_MESSAGE`).
+    NotPresent,
+    /// The signature is valid under the matched sender key.
+    Verified,
+    /// No signature public key for the claimed sender is loaded.
+    NoKey,
+    /// The signature algorithm is not implemented by this build.
+    Unsupported,
+    /// A key was found but the signature (or key encoding) is invalid.
+    Failed,
+}
+
+impl SignatureStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotAttempted => "未验证",
+            Self::NotPresent => "无签名",
+            Self::Verified => "签名有效",
+            Self::NoKey => "缺少公钥",
+            Self::Unsupported => "不支持",
+            Self::Failed => "签名无效",
+        }
+    }
+
+    pub fn color(self) -> Color32 {
+        match self {
+            Self::Verified => Color32::from_rgb(88, 201, 135),
+            Self::NoKey => Color32::from_rgb(238, 181, 74),
+            Self::Unsupported => Color32::from_rgb(200, 160, 255),
+            Self::Failed => Color32::from_rgb(235, 104, 104),
+            Self::NotAttempted | Self::NotPresent => Color32::from_rgb(140, 150, 165),
+        }
+    }
+
+    pub fn is_verified(self) -> bool {
+        self == Self::Verified
+    }
+}
+
+/// One public key tried while verifying a packet signature.
+#[derive(Clone, Debug, Serialize)]
+pub struct SignatureAttempt {
+    pub key_owner: String,
+    pub key_source: String,
+    pub algorithm: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Signature verification result plus provenance for the key that matched.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SignatureOutcome {
+    pub status: SignatureStatus,
+    /// Sender claimed by the packet envelope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub algorithm: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub attempts: Vec<SignatureAttempt>,
+}
+
+impl SignatureOutcome {
+    pub fn is_verified(&self) -> bool {
+        self.status == SignatureStatus::Verified
+    }
+}
+
 /// One key or session-secret candidate that was tried for a packet.
 #[derive(Clone, Debug, Serialize)]
 pub struct DecryptionAttempt {
@@ -207,6 +291,9 @@ pub struct FragmentGroup {
     /// Populated after key material is loaded; `None` means decryption has not
     /// been attempted for this group yet.
     pub decryption: Option<DecryptionOutcome>,
+    /// Populated after public keys are loaded; `None` means signature
+    /// verification has not been attempted for this group yet.
+    pub signature: Option<SignatureOutcome>,
 }
 
 impl FragmentGroup {
@@ -294,6 +381,33 @@ impl LoadedLogs {
         self.messages
             .iter()
             .filter(|message| message.status == MessageStatus::Invalid)
+            .count()
+    }
+
+    pub fn signature_count(&self, status: SignatureStatus) -> usize {
+        self.messages
+            .iter()
+            .filter(|message| {
+                message
+                    .signature
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.status == status)
+            })
+            .count()
+    }
+
+    /// Number of packets that carried a signature field and were checked.
+    pub fn signed_packet_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|message| {
+                message.signature.as_ref().is_some_and(|outcome| {
+                    !matches!(
+                        outcome.status,
+                        SignatureStatus::NotAttempted | SignatureStatus::NotPresent
+                    )
+                })
+            })
             .count()
     }
 }

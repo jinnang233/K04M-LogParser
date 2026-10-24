@@ -1,5 +1,6 @@
 //! egui desktop front end.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,12 +12,15 @@ use eframe::egui::{
     Margin, RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2,
 };
 
+use crate::capture::{
+    CaptureAnalysis, CaptureOptions, ChannelPayload, analyze_captures, export_capture_json,
+};
 use crate::decrypt::{KeyLoadSummary, KeyStore};
 use crate::export::export_json;
-use crate::log_reader::load_paths;
+use crate::log_reader::{discover_inputs, load_paths};
 use crate::model::{
-    DataField, DecryptionOutcome, DecryptionStatus, FragmentGroup, LoadedLogs, MessageStatus,
-    ParsedPacket,
+    DataField, DecryptionOutcome, DecryptionStatus, FragmentGroup, FragmentSlot, LoadedLogs,
+    MessageStatus, ParsedPacket, SignatureStatus, SourceInfo,
 };
 use crate::packet::{
     FlatField, byte_categories, flatten_fields, hex, hex_preview, packet_type_chinese,
@@ -85,6 +89,8 @@ impl SelectedField {
 
 pub struct K04MApp {
     data: Option<LoadedLogs>,
+    /// Present when the current inputs are packet captures.
+    capture: Option<CaptureAnalysis>,
     paths: Vec<PathBuf>,
     key_store: KeyStore,
     key_summary: Option<KeyLoadSummary>,
@@ -101,6 +107,7 @@ pub struct K04MApp {
     show_sources: bool,
     show_warnings: bool,
     show_keys: bool,
+    show_capture: bool,
 }
 
 impl K04MApp {
@@ -112,6 +119,7 @@ impl K04MApp {
         install_fonts(&cc.egui_ctx);
         let mut app = Self {
             data: None,
+            capture: None,
             paths: Vec::new(),
             key_store: KeyStore::default(),
             key_summary: None,
@@ -128,6 +136,7 @@ impl K04MApp {
             show_sources: false,
             show_warnings: false,
             show_keys: false,
+            show_capture: false,
         };
         app.apply_theme(&cc.egui_ctx);
         if !initial_keys.is_empty() {
@@ -191,7 +200,30 @@ impl K04MApp {
             return;
         }
         self.paths = dedupe_paths(paths);
-        match load_paths(self.paths.clone()) {
+        let inputs = match discover_inputs(self.paths.clone()) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                self.fail(error);
+                return;
+            }
+        };
+        if !inputs.logs.is_empty() && !inputs.captures.is_empty() {
+            self.fail(
+                "不能在同一次加载中混合日志与 pcap/pcapng 输入；请分别打开（或先用 --export 分别导出）"
+                    .to_owned(),
+            );
+            return;
+        }
+        if !inputs.captures.is_empty() {
+            self.load_captures(inputs.captures);
+        } else {
+            self.load_logs(inputs.logs);
+        }
+    }
+
+    fn load_logs(&mut self, paths: Vec<PathBuf>) {
+        self.capture = None;
+        match load_paths(paths) {
             Ok(data) => {
                 let summary = if data.messages.is_empty() {
                     format!(
@@ -220,15 +252,81 @@ impl K04MApp {
                 self.data = Some(data);
                 self.redecrypt();
             }
-            Err(error) => {
-                self.status_error = true;
-                self.status = error;
-            }
+            Err(error) => self.fail(error),
         }
     }
 
+    fn load_captures(&mut self, paths: Vec<PathBuf>) {
+        match analyze_captures(&paths, &self.key_store, &CaptureOptions::default()) {
+            Ok(analysis) => {
+                let data = capture_to_loaded(&analysis);
+                let summary = analysis.summary.clone();
+                self.status_error = false;
+                self.status = format!(
+                    "已解析 {} 个抓包、{} 个 TCP 会话、{} 个 Minecraft 连接；聊天消息 {} 条（已解密 {}、已验签 {}）",
+                    summary.capture_files,
+                    summary.conversations,
+                    summary.minecraft_connections,
+                    summary.chat_transfers,
+                    summary.chat_transfers_decrypted,
+                    summary.signatures_verified
+                );
+                self.selected_message = (!data.messages.is_empty()).then_some(0);
+                self.selected_field = None;
+                self.pending_hex_offset = None;
+                self.search.clear();
+                self.filter = MessageFilter::All;
+                self.data = Some(data);
+                self.capture = Some(analysis);
+            }
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn refresh_capture(&mut self) {
+        let paths = self.paths.clone();
+        if paths.is_empty() {
+            return;
+        }
+        let inputs = match discover_inputs(paths) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                self.fail(error);
+                return;
+            }
+        };
+        if inputs.captures.is_empty() {
+            return;
+        }
+        match analyze_captures(
+            &inputs.captures,
+            &self.key_store,
+            &CaptureOptions::default(),
+        ) {
+            Ok(analysis) => {
+                let data = capture_to_loaded(&analysis);
+                let selected = self
+                    .selected_message
+                    .filter(|index| *index < data.messages.len());
+                self.selected_message = selected.or((!data.messages.is_empty()).then_some(0));
+                self.selected_field = None;
+                self.pending_hex_offset = None;
+                self.data = Some(data);
+                self.capture = Some(analysis);
+            }
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn fail(&mut self, error: String) {
+        self.status_error = true;
+        self.status = error;
+    }
+
     fn redecrypt(&mut self) {
-        if let Some(data) = &mut self.data {
+        if self.capture.is_some() {
+            self.refresh_capture();
+        } else if let Some(data) = &mut self.data {
             self.key_store.decrypt_loaded(data);
         }
     }
@@ -245,6 +343,22 @@ impl K04MApp {
                 })
                 .count()
         })
+    }
+
+    fn signature_count(&self, status: SignatureStatus) -> usize {
+        if let Some(capture) = &self.capture {
+            let summary = &capture.summary;
+            return match status {
+                SignatureStatus::Verified => summary.signatures_verified,
+                SignatureStatus::NoKey => summary.signatures_no_key,
+                SignatureStatus::Unsupported => summary.signatures_unsupported,
+                SignatureStatus::Failed => summary.signatures_failed,
+                SignatureStatus::NotPresent | SignatureStatus::NotAttempted => 0,
+            };
+        }
+        self.data
+            .as_ref()
+            .map_or(0, |data| data.signature_count(status))
     }
 
     fn load_keys(&mut self, paths: Vec<PathBuf>) {
@@ -268,7 +382,7 @@ impl K04MApp {
 
     fn open_key_files_dialog(&mut self) {
         let mut dialog = rfd::FileDialog::new()
-            .add_filter("Krypt04Mcg 密钥/会话 JSON", &["json"])
+            .add_filter("Krypt04Mcg 密钥/公钥/会话 JSON", &["json"])
             .add_filter("所有文件", &["*"]);
         if let Some(directory) = self.initial_directory() {
             dialog = dialog.set_directory(directory);
@@ -299,7 +413,9 @@ impl K04MApp {
 
     fn open_files_dialog(&mut self) {
         let mut dialog = rfd::FileDialog::new()
+            .add_filter("日志与抓包", &["log", "gz", "pcap", "pcapng"])
             .add_filter("Minecraft 日志", &["log", "gz"])
+            .add_filter("pcap/pcapng 抓包", &["pcap", "pcapng"])
             .add_filter("所有文件", &["*"]);
         if let Some(directory) = self.initial_directory() {
             dialog = dialog.set_directory(directory);
@@ -334,10 +450,12 @@ impl K04MApp {
             self.status = "没有可导出的消息".to_owned();
             return;
         };
-        let name = format!(
-            "krypt04mcg-parsed-{}.json",
-            Local::now().format("%Y%m%d-%H%M%S")
-        );
+        let prefix = if self.capture.is_some() {
+            "krypt04mcg-capture"
+        } else {
+            "krypt04mcg-parsed"
+        };
+        let name = format!("{prefix}-{}.json", Local::now().format("%Y%m%d-%H%M%S"));
         let mut dialog = rfd::FileDialog::new()
             .add_filter("JSON", &["json"])
             .set_file_name(&name);
@@ -349,6 +467,22 @@ impl K04MApp {
         };
         if path.extension().is_none() {
             path.set_extension("json");
+        }
+        if let Some(capture) = &self.capture {
+            match export_capture_json(&path, capture) {
+                Ok(()) => {
+                    self.status_error = false;
+                    self.status = format!(
+                        "已导出 {} 个连接、{} 条聊天消息、{} 条 API 流到 {}",
+                        capture.connections.len(),
+                        capture.chat_transfers.len(),
+                        capture.api_streams.len(),
+                        path.display()
+                    );
+                }
+                Err(error) => self.fail(error),
+            }
+            return;
         }
         match export_json(&path, data) {
             Ok(()) => {
@@ -490,7 +624,7 @@ impl K04MApp {
                     }
                     if ui
                         .button("打开文件夹…")
-                        .on_hover_text("Ctrl+Shift+O；递归读取 .log / .log.gz")
+                        .on_hover_text("Ctrl+Shift+O；递归读取 .log / .log.gz / .pcap / .pcapng")
                         .clicked()
                     {
                         open_folder = true;
@@ -506,11 +640,12 @@ impl K04MApp {
                     {
                         export = true;
                     }
-                    let key_count =
-                        self.key_store.private_keys.len() + self.key_store.sessions.len();
+                    let key_count = self.key_store.private_keys.len()
+                        + self.key_store.sessions.len()
+                        + self.key_store.signatures.entries().len();
                     if ui
                         .button(format!("密钥 {key_count}"))
-                        .on_hover_text("Ctrl+K；加载多个私钥或会话密钥，解密包正文")
+                        .on_hover_text("Ctrl+K；加载私钥/会话密钥解密，加载签名公钥验签")
                         .clicked()
                     {
                         open_keys = true;
@@ -534,6 +669,17 @@ impl K04MApp {
                                 self.show_sources = true;
                             }
                         }
+                        if let Some(capture) = &self.capture
+                            && ui
+                                .button(format!(
+                                    "抓包详情 · {} 连接 / {} 流",
+                                    capture.connections.len(),
+                                    capture.api_streams.len()
+                                ))
+                                .clicked()
+                        {
+                            self.show_capture = true;
+                        }
                         ui.add(
                             TextEdit::singleline(&mut self.search)
                                 .hint_text("搜索 ID / 玩家 / 类型")
@@ -544,9 +690,15 @@ impl K04MApp {
 
                 if let Some(data) = &self.data {
                     ui.add_space(2.0);
+                    let capture = self.capture.as_ref();
+                    let unit = if capture.is_some() {
+                        "抓包"
+                    } else {
+                        "文件"
+                    };
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
-                            RichText::new(format!("{} 个文件", data.sources.len()))
+                            RichText::new(format!("{} 个{unit}", data.sources.len()))
                                 .small()
                                 .color(DIM),
                         );
@@ -558,10 +710,31 @@ impl K04MApp {
                         );
                         ui.separator();
                         ui.label(
-                            RichText::new(format!("{} 条消息", data.messages.len()))
+                            RichText::new(format!(
+                                "{} 条{}",
+                                data.messages.len(),
+                                if capture.is_some() {
+                                    "聊天消息"
+                                } else {
+                                    "消息"
+                                }
+                            ))
+                            .small()
+                            .color(DIM),
+                        );
+                        if let Some(capture) = capture {
+                            ui.separator();
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} 个连接 · {} 个 API 流 · {} 个公钥共享",
+                                    capture.connections.len(),
+                                    capture.api_streams.len(),
+                                    capture.public_key_shares.len()
+                                ))
                                 .small()
                                 .color(DIM),
-                        );
+                            );
+                        }
                         for (label, count, color) in [
                             ("已解析", data.parsed_count(), MessageStatus::Parsed.color()),
                             (
@@ -592,6 +765,31 @@ impl K04MApp {
                                 RichText::new(format!("已解密 {decrypted}"))
                                     .small()
                                     .color(DecryptionStatus::Decrypted.color()),
+                            );
+                        }
+                        let verified = self.signature_count(SignatureStatus::Verified);
+                        if verified > 0 {
+                            ui.label(
+                                RichText::new(format!("已验签 {verified}"))
+                                    .small()
+                                    .color(SignatureStatus::Verified.color()),
+                            );
+                        }
+                        let no_key = self.signature_count(SignatureStatus::NoKey);
+                        if no_key > 0 {
+                            ui.label(
+                                RichText::new(format!("待验签 {no_key}"))
+                                    .small()
+                                    .color(SignatureStatus::NoKey.color()),
+                            )
+                            .on_hover_text("存在签名包，但没有对应的签名公钥");
+                        }
+                        let failed = self.signature_count(SignatureStatus::Failed);
+                        if failed > 0 {
+                            ui.label(
+                                RichText::new(format!("验签失败 {failed}"))
+                                    .small()
+                                    .color(SignatureStatus::Failed.color()),
                             );
                         }
                         if !self.paths.is_empty() {
@@ -675,9 +873,13 @@ impl K04MApp {
                         ui.vertical_centered(|ui| {
                             ui.label(RichText::new("没有找到 Krypt04Mcg 消息").color(DIM));
                             ui.label(
-                                RichText::new("日志中需要包含 [KRYPT04MCG] 分片行")
-                                    .small()
-                                    .color(DIM),
+                                RichText::new(if self.capture.is_some() {
+                                    "抓包中需要包含 krypt04mcg:chat_fragment 通道"
+                                } else {
+                                    "日志中需要包含 [KRYPT04MCG] 分片行"
+                                })
+                                .small()
+                                .color(DIM),
                             );
                         });
                         return;
@@ -701,7 +903,7 @@ impl K04MApp {
                 } else {
                     ui.add_space(24.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("尚未加载日志").color(DIM));
+                        ui.label(RichText::new("尚未加载日志或抓包").color(DIM));
                     });
                 }
             });
@@ -740,6 +942,8 @@ impl K04MApp {
             message_header(ui, message, message_index, ctx);
             ui.add_space(6.0);
             decryption_panel(ui, message, ctx, &mut open_key_dialog);
+            ui.add_space(6.0);
+            signature_panel(ui, message, ctx, &mut open_key_dialog);
             ui.add_space(6.0);
 
             if let Some(packet) = &message.packet
@@ -944,19 +1148,19 @@ impl K04MApp {
             ui.add_space(8.0);
             ui.label(
                 RichText::new(
-                    "读取 Minecraft 服务端日志，重组 [KRYPT04MCG] 分片，解析二进制包并高亮字段字节。",
+                    "读取 Minecraft 服务端日志或 pcap/pcapng 抓包，重组 [KRYPT04MCG] 分片，解析二进制包、验签并高亮字段字节。",
                 )
                 .size(15.0)
                 .color(DIM),
             );
             ui.add_space(22.0);
             ui.horizontal(|ui| {
-                let total_width = 520.0;
+                let total_width = 560.0;
                 ui.add_space(((ui.available_width() - total_width) / 2.0).max(0.0));
-                if ui.button("打开日志文件…").clicked() {
+                if ui.button("打开日志/抓包…").clicked() {
                     self.open_files_dialog();
                 }
-                if ui.button("打开 logs 文件夹…").clicked() {
+                if ui.button("打开日志/抓包文件夹…").clicked() {
                     self.open_folder_dialog();
                 }
                 if ui.button("加载私钥…").clicked() {
@@ -978,19 +1182,19 @@ impl K04MApp {
                     ui.label(RichText::new("使用方式").strong());
                     ui.add_space(6.0);
                     for line in [
-                        "1. 打开最新的 latest.log，或包含多个 .log / .log.gz 的 logs 文件夹。",
-                        "2. 支持乱序分片、重复分片和跨文件合并；重复行会保留并标记。",
-                        "3. 左侧选择消息，右侧查看二进制与全部包字段。",
+                        "1. 打开 latest.log、包含多个 .log / .log.gz 的 logs 文件夹，或 .pcap / .pcapng 抓包。",
+                        "2. 日志支持乱序分片、重复分片和跨文件合并；抓包会自动重组 TCP 与 Krypt04Mcg 通道。",
+                        "3. 左侧选择消息，右侧查看二进制与全部包字段；抓包模式还可打开“抓包详情”。",
                         "4. 点击字段，二进制中对应字节会以黄色高亮；悬停字段可临时预览。",
-                        "5. 加载私钥与会话密钥（Ctrl+K），自动解密 KEM 消息和会话消息正文。",
-                        "6. “导出 JSON” 会导出所有重组结果、字段、分片来源、解密明文和原始数据。",
+                        "5. 加载私钥、会话密钥与签名公钥（Ctrl+K），解密正文并验证包签名。",
+                        "6. “导出 JSON” 会导出全部结果：日志为消息/字段/明文，抓包为连接/事件/流/公钥共享。",
                     ] {
                         ui.label(RichText::new(line).small().color(DIM));
                     }
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(
-                            "说明：没有匹配的私钥或会话密钥时只能查看密文结构。解密成功表示 AEAD 认证通过；本工具不验证 PQ 签名，也不建立发送者信任。",
+                            "说明：没有匹配的私钥/会话密钥时只能查看密文结构；没有签名公钥时无法验签。签名有效只证明包由该公钥持有者签发，不建立额外信任或新鲜度。",
                         )
                         .small()
                         .color(MessageStatus::Incomplete.color()),
@@ -1032,7 +1236,7 @@ impl K04MApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new(
-                                "Ctrl+O 打开 · Ctrl+Shift+O 文件夹 · Ctrl+K 密钥 · Ctrl+R 重载 · Ctrl+E 导出",
+                                "Ctrl+O 打开日志/抓包 · Ctrl+Shift+O 文件夹 · Ctrl+K 密钥/公钥 · Ctrl+R 重载 · Ctrl+E 导出",
                             )
                             .small()
                             .color(DIM),
@@ -1042,10 +1246,83 @@ impl K04MApp {
             });
     }
 
+    fn capture_details(&mut self, ctx: &egui::Context) {
+        if !self.show_capture {
+            return;
+        }
+        let Some(analysis) = &self.capture else {
+            self.show_capture = false;
+            return;
+        };
+        let mut open = self.show_capture;
+        egui::Window::new("抓包详情")
+            .open(&mut open)
+            .default_width(1120.0)
+            .show(ctx, |ui| {
+                ScrollArea::vertical()
+                    .id_salt("capture_details_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        capture_overview(ui, analysis);
+                        ui.separator();
+                        capture_connections(ui, analysis);
+                        ui.separator();
+                        capture_public_keys(ui, analysis);
+                        ui.separator();
+                        capture_streams(ui, analysis);
+                        ui.separator();
+                        capture_events(ui, analysis);
+                        if !analysis.warnings.is_empty() {
+                            ui.separator();
+                            egui::CollapsingHeader::new(format!(
+                                "抓包警告 ({})",
+                                analysis.warnings.len()
+                            ))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                for warning in &analysis.warnings {
+                                    ui.label(
+                                        RichText::new(format!("· {warning}"))
+                                            .small()
+                                            .color(MessageStatus::Incomplete.color()),
+                                    );
+                                }
+                            });
+                        }
+                        ui.separator();
+                        egui::CollapsingHeader::new("抓包来源")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                egui::Grid::new("capture_sources_grid")
+                                    .num_columns(5)
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        ui.strong("文件");
+                                        ui.strong("TCP 会话");
+                                        ui.strong("Minecraft 连接");
+                                        ui.strong("数据包");
+                                        ui.strong("大小");
+                                        ui.end_row();
+                                        for source in &analysis.sources {
+                                            ui.label(&source.name).on_hover_text(&source.path);
+                                            ui.label(source.conversations.to_string());
+                                            ui.label(source.minecraft_connections.to_string());
+                                            ui.label(source.packets.to_string());
+                                            ui.label(format!("{} B", source.bytes));
+                                            ui.end_row();
+                                        }
+                                    });
+                            });
+                    });
+            });
+        self.show_capture = open;
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.capture_details(ctx);
         if self.show_sources {
             let mut open = self.show_sources;
-            egui::Window::new("日志来源")
+            egui::Window::new("输入来源")
                 .open(&mut open)
                 .default_width(720.0)
                 .show(ctx, |ui| {
@@ -1092,22 +1369,25 @@ impl K04MApp {
             let mut clear = false;
             let mut remove_key: Option<usize> = None;
             let mut remove_session: Option<usize> = None;
-            egui::Window::new("私钥与会话密钥")
+            let mut remove_public: Option<usize> = None;
+            egui::Window::new("私钥、会话密钥与签名公钥")
                 .open(&mut open)
-                .default_width(940.0)
+                .default_width(980.0)
                 .show(ctx, |ui| {
                     ui.label(
                         RichText::new(format!(
-                            "{} 个私钥 · {} 个会话密钥 · 已解密 {} 条消息",
+                            "{} 个私钥 · {} 个会话密钥 · {} 个签名公钥 · 已解密 {} 条消息 · 已验签 {} 条",
                             self.key_store.private_keys.len(),
                             self.key_store.sessions.len(),
-                            self.decrypted_count()
+                            self.key_store.signatures.entries().len(),
+                            self.decrypted_count(),
+                            self.signature_count(SignatureStatus::Verified)
                         ))
                         .small()
                         .color(DIM),
                     );
                     ui.horizontal(|ui| {
-                        if ui.button("加载私钥文件…").clicked() {
+                        if ui.button("加载密钥/公钥文件…").clicked() {
                             load_files = true;
                         }
                         if ui.button("加载账户/密钥目录…").clicked() {
@@ -1125,7 +1405,7 @@ impl K04MApp {
                     });
                     ui.label(
                         RichText::new(
-                            "支持 Krypt04Mcg 的 LocalKeyMaterial（keys/private/local.json）、sessions/*.json、账户目录，以及包含多个账户的父目录。KMCGSEC1 加密文件会自动使用同目录 secrets/master.key 解密。私钥只保存在内存中，绝不会写入导出 JSON。",
+                            "支持 Krypt04Mcg 的 LocalKeyMaterial（keys/private/local.json）、sessions/*.json、keys/public/*.json、账户目录，以及包含多个账户的父目录。KMCGSEC1 加密文件会自动使用同目录 secrets/master.key 解密。私钥只保存在内存中，绝不会写入导出 JSON；签名公钥只用于验签。",
                         )
                         .small()
                         .color(DIM),
@@ -1138,13 +1418,14 @@ impl K04MApp {
 
                     if self.key_store.private_keys.is_empty()
                         && self.key_store.sessions.is_empty()
+                        && self.key_store.signatures.is_empty()
                     {
                         ui.add_space(12.0);
                         ui.vertical_centered(|ui| {
                             ui.label(RichText::new("尚未加载任何密钥").color(DIM));
                             ui.label(
                                 RichText::new(
-                                    "私钥用于解密 KEM 消息与会话交换请求；会话密钥用于解密 SESSION_MESSAGE。",
+                                    "私钥用于解密 KEM 消息与会话交换请求；会话密钥用于解密 SESSION_MESSAGE；签名公钥用于验证包签名（keys/public 或抓包中的公钥共享）。",
                                 )
                                 .small()
                                 .color(DIM),
@@ -1240,10 +1521,61 @@ impl K04MApp {
                                             }
                                             ui.end_row();
                                         }
+
+                                        for (index, key) in
+                                            self.key_store.signatures.entries().iter().enumerate()
+                                        {
+                                            ui.label(
+                                                RichText::new("签名公钥")
+                                                    .small()
+                                                    .color(ACCENT),
+                                            );
+                                            ui.label(&key.owner)
+                                                .on_hover_text(format!("UUID：{}", key.uuid));
+                                            ui.label(
+                                                RichText::new(&key.algorithm)
+                                                    .small()
+                                                    .monospace(),
+                                            );
+                                            ui.label(
+                                                RichText::new(truncate(&key.fingerprint, 16))
+                                                    .small()
+                                                    .monospace()
+                                                    .color(DIM),
+                                            )
+                                            .on_hover_text(&key.fingerprint);
+                                            ui.label(
+                                                RichText::new(truncate(&key.source, 42))
+                                                    .small()
+                                                    .color(DIM),
+                                            )
+                                            .on_hover_text(&key.source);
+                                            if ui.small_button("移除").clicked() {
+                                                remove_public = Some(index);
+                                            }
+                                            ui.end_row();
+                                        }
                                     });
                             });
                     }
 
+                    if !self.key_store.signatures.warnings().is_empty() {
+                        ui.separator();
+                        egui::CollapsingHeader::new(format!(
+                            "签名公钥提示 ({})",
+                            self.key_store.signatures.warnings().len()
+                        ))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for warning in self.key_store.signatures.warnings() {
+                                ui.label(
+                                    RichText::new(format!("· {warning}"))
+                                        .small()
+                                        .color(MessageStatus::Incomplete.color()),
+                                );
+                            }
+                        });
+                    }
                     if !self.key_store.warnings.is_empty() {
                         ui.separator();
                         egui::CollapsingHeader::new(format!(
@@ -1289,6 +1621,13 @@ impl K04MApp {
                 self.status_error = false;
                 self.status = "已移除一个会话密钥并重新解密".to_owned();
             }
+            if let Some(index) = remove_public {
+                self.key_store.signatures.remove(index);
+                self.key_summary = None;
+                self.redecrypt();
+                self.status_error = false;
+                self.status = "已移除一个签名公钥并重新验签".to_owned();
+            }
         }
 
         if self.show_warnings {
@@ -1315,6 +1654,462 @@ impl K04MApp {
                 });
             self.show_warnings = open;
         }
+    }
+}
+
+fn capture_overview(ui: &mut Ui, analysis: &CaptureAnalysis) {
+    let summary = &analysis.summary;
+    egui::CollapsingHeader::new("抓包概览")
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::Grid::new("capture_summary_grid")
+                .num_columns(2)
+                .spacing([18.0, 5.0])
+                .show(ui, |ui| {
+                    for (label, value) in [
+                        ("抓包文件", summary.capture_files.to_string()),
+                        ("TCP 会话", summary.conversations.to_string()),
+                        (
+                            "Minecraft 连接",
+                            format!(
+                                "{}（{} 个含 Krypt04Mcg）",
+                                summary.minecraft_connections, summary.krypt_connections
+                            ),
+                        ),
+                        ("通道消息", summary.channel_messages.to_string()),
+                        ("聊天分片", summary.chat_fragments.to_string()),
+                        (
+                            "聊天消息",
+                            format!(
+                                "{}（已解密 {}）",
+                                summary.chat_transfers, summary.chat_transfers_decrypted
+                            ),
+                        ),
+                        ("公钥共享", summary.public_key_shares.to_string()),
+                        (
+                            "API 流",
+                            format!(
+                                "{} 条 / {} 条记录（已解密 {}）",
+                                summary.api_streams,
+                                summary.api_data_record_observations,
+                                summary.api_data_records_decrypted
+                            ),
+                        ),
+                        (
+                            "签名",
+                            format!(
+                                "检查 {}：有效 {} / 缺公钥 {} / 不支持 {} / 无效 {}",
+                                summary.signature_packets,
+                                summary.signatures_verified,
+                                summary.signatures_no_key,
+                                summary.signatures_unsupported,
+                                summary.signatures_failed
+                            ),
+                        ),
+                        (
+                            "明文字节",
+                            summary.total_plaintext_bytes.to_string(),
+                        ),
+                        ("Minecraft 版本", analysis.minecraft_version.clone()),
+                        ("协议版本", analysis.protocol_version.to_string()),
+                    ] {
+                        ui.label(RichText::new(label).small().color(DIM));
+                        ui.label(RichText::new(value).small().monospace());
+                        ui.end_row();
+                    }
+                });
+            ui.label(
+                RichText::new(
+                    "公钥共享与 keys/public 中的签名公钥用于验签；签名有效只证明包由该公钥持有者签发，不建立额外信任或新鲜度。",
+                )
+                .small()
+                .color(DIM),
+            );
+        });
+}
+
+fn capture_connections(ui: &mut Ui, analysis: &CaptureAnalysis) {
+    egui::CollapsingHeader::new(format!("Minecraft 连接 ({})", analysis.connections.len()))
+        .default_open(true)
+        .show(ui, |ui| {
+            if analysis.connections.is_empty() {
+                ui.label(
+                    RichText::new("没有识别到 Minecraft 连接")
+                        .small()
+                        .color(DIM),
+                );
+                return;
+            }
+            egui::Grid::new("capture_connections_grid")
+                .num_columns(7)
+                .striped(true)
+                .spacing([12.0, 5.0])
+                .show(ui, |ui| {
+                    ui.strong("#");
+                    ui.strong("玩家");
+                    ui.strong("连接");
+                    ui.strong("协议");
+                    ui.strong("Brand");
+                    ui.strong("通道消息");
+                    ui.strong("状态");
+                    ui.end_row();
+                    for connection in &analysis.connections {
+                        ui.label(connection.index.to_string());
+                        ui.label(connection.player.as_deref().unwrap_or("(未知)"))
+                            .on_hover_text(connection.player_uuid.as_deref().unwrap_or(""));
+                        ui.label(
+                            RichText::new(format!(
+                                "{} -> {}",
+                                connection.client, connection.server
+                            ))
+                            .small()
+                            .monospace(),
+                        );
+                        ui.label(
+                            connection
+                                .protocol_version
+                                .map(|version| version.to_string())
+                                .unwrap_or_else(|| "?".to_owned()),
+                        );
+                        ui.label(format!(
+                            "{}/{}",
+                            connection.client_brand.as_deref().unwrap_or("-"),
+                            connection.server_brand.as_deref().unwrap_or("-")
+                        ));
+                        ui.label(format!(
+                            "聊天 {} · 公钥 {} · 控制 {} · 隧道 {} · 流记录 {}",
+                            connection.chat_fragment_messages,
+                            connection.public_key_messages,
+                            connection.control_messages,
+                            connection.tunnel_messages,
+                            connection.data_records
+                        ));
+                        ui.label(&connection.status);
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn capture_public_keys(ui: &mut Ui, analysis: &CaptureAnalysis) {
+    egui::CollapsingHeader::new(format!("公钥共享 ({})", analysis.public_key_shares.len()))
+        .default_open(false)
+        .show(ui, |ui| {
+            if analysis.public_key_shares.is_empty() {
+                ui.label(RichText::new("抓包中没有公钥共享").small().color(DIM));
+                return;
+            }
+            for share in &analysis.public_key_shares {
+                let state = if share.complete {
+                    format!(
+                        "{}/{} 分片 · 完整",
+                        share.received_chunks, share.total_chunks
+                    )
+                } else {
+                    format!(
+                        "{}/{} 分片 · 不完整",
+                        share.received_chunks, share.total_chunks
+                    )
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&share.sender).strong());
+                    ui.label(
+                        RichText::new(format!("→ {}", share.receiver.as_deref().unwrap_or("?")))
+                            .small()
+                            .color(DIM),
+                    );
+                    ui.label(RichText::new(state).small().color(DIM));
+                    if let Some(identity) = &share.identity {
+                        ui.label(
+                            RichText::new(format!("owner={}", identity.owner))
+                                .small()
+                                .monospace(),
+                        );
+                        if let Some(kem) = &identity.kem_public_key {
+                            ui.label(
+                                RichText::new(format!("KEM {}", kem.algorithm))
+                                    .small()
+                                    .color(DIM),
+                            );
+                        }
+                        if let Some(signature) = &identity.signature_public_key {
+                            ui.label(
+                                RichText::new(format!("签名 {}", signature.algorithm))
+                                    .small()
+                                    .color(ACCENT),
+                            );
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new("未解析出身份")
+                                .small()
+                                .color(SignatureStatus::NoKey.color()),
+                        );
+                    }
+                });
+                for warning in &share.warnings {
+                    ui.label(
+                        RichText::new(format!("· {warning}"))
+                            .small()
+                            .color(MessageStatus::Incomplete.color()),
+                    );
+                }
+            }
+        });
+}
+
+fn capture_streams(ui: &mut Ui, analysis: &CaptureAnalysis) {
+    egui::CollapsingHeader::new(format!("API 流 ({})", analysis.api_streams.len()))
+        .default_open(false)
+        .show(ui, |ui| {
+            if analysis.api_streams.is_empty() {
+                ui.label(RichText::new("抓包中没有 API 流").small().color(DIM));
+                return;
+            }
+            for stream in &analysis.api_streams {
+                egui::CollapsingHeader::new(format!(
+                    "{} · {} · {} -> {}",
+                    truncate(&stream.stream_id, 18),
+                    stream.channel,
+                    stream.initiator,
+                    stream.responder
+                ))
+                .id_salt(("capture_stream", &stream.stream_id))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "session {} · 状态 {}",
+                            truncate(&stream.session_id, 24),
+                            stream.end_reason.as_deref().unwrap_or("-")
+                        ))
+                        .small()
+                        .color(DIM),
+                    );
+                    for direction in &stream.directions {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} → {}",
+                                    direction.sender, direction.receiver
+                                ))
+                                .small(),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "· {} 条记录 / 已解密 {} / 失败 {} · {}",
+                                    direction.record_count,
+                                    direction.decrypted_records,
+                                    direction.failed_records,
+                                    direction.content.kind
+                                ))
+                                .small()
+                                .color(
+                                    if direction.failed_records == 0 {
+                                        DecryptionStatus::Decrypted.color()
+                                    } else {
+                                        DecryptionStatus::Failed.color()
+                                    },
+                                ),
+                            );
+                            if let Some(name) = &direction.content.file_name {
+                                ui.label(RichText::new(format!("· 文件 {name}")).small());
+                            }
+                            ui.label(
+                                RichText::new(format!("· {} 字节", direction.content.length))
+                                    .small()
+                                    .color(DIM),
+                            );
+                        });
+                        if let Some(preview) = &direction.content.text_preview {
+                            ui.label(
+                                RichText::new(truncate(preview, 180))
+                                    .small()
+                                    .monospace()
+                                    .color(DIM),
+                            );
+                        }
+                        for warning in &direction.warnings {
+                            ui.label(
+                                RichText::new(format!("· {warning}"))
+                                    .small()
+                                    .color(MessageStatus::Incomplete.color()),
+                            );
+                        }
+                    }
+                });
+            }
+        });
+}
+
+fn capture_events(ui: &mut Ui, analysis: &CaptureAnalysis) {
+    let other_events: Vec<_> = analysis
+        .events
+        .iter()
+        .filter(|event| event.channel != "krypt04mcg:chat_fragment")
+        .collect();
+    egui::CollapsingHeader::new(format!(
+        "通道事件 ({})",
+        analysis.events.len()
+    ))
+    .default_open(false)
+    .show(ui, |ui| {
+        ui.label(
+            RichText::new(format!(
+                "共 {} 个通道事件；聊天分片已显示在主消息列表，这里列出其余 {} 个（最多 3000 个）。",
+                analysis.events.len(),
+                other_events.len()
+            ))
+            .small()
+            .color(DIM),
+        );
+        for event in other_events.iter().take(3000) {
+            let kind = match &event.payload {
+                ChannelPayload::PublicKey { peer, .. } => format!("public_key → {peer}"),
+                ChannelPayload::Control {
+                    kind,
+                    peer,
+                    slot,
+                    business_channel,
+                    hmac,
+                    exchange,
+                    ..
+                } => {
+                    let signature = exchange
+                        .as_ref()
+                        .map(|exchange| exchange.signature.status.label())
+                        .unwrap_or("-");
+                    let hmac = hmac
+                        .as_ref()
+                        .map(|hmac| if hmac.verified { "通过" } else { "未通过" })
+                        .unwrap_or("-");
+                    format!(
+                        "control {kind} → {peer} slot={slot} channel={business_channel} HMAC={hmac} 验签={signature}"
+                    )
+                }
+                ChannelPayload::Tunnel {
+                    peer,
+                    stream_id,
+                    lease,
+                    signature,
+                    ..
+                } => format!(
+                    "tunnel → {peer} stream={} lease={lease} 验签={}",
+                    truncate(stream_id, 18),
+                    signature
+                        .as_ref()
+                        .map(|outcome| outcome.status.label())
+                        .unwrap_or("-")
+                ),
+                ChannelPayload::Unknown {
+                    payload_length, ..
+                } => format!("unknown {payload_length} B"),
+                ChannelPayload::ChatFragment { .. } => "chat_fragment".to_owned(),
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(&event.time.local)
+                        .small()
+                        .monospace()
+                        .color(DIM),
+                );
+                ui.label(RichText::new(&event.channel).small().color(ACCENT));
+                ui.label(RichText::new(kind).small());
+                if let Some(error) = &event.error {
+                    ui.label(
+                        RichText::new(truncate(error, 120))
+                            .small()
+                            .color(MessageStatus::Invalid.color()),
+                    );
+                }
+            });
+        }
+        if other_events.len() > 3000 {
+            ui.label(
+                RichText::new("事件过多，仅显示前 3000 个；完整内容请导出 JSON。")
+                    .small()
+                    .color(MessageStatus::Incomplete.color()),
+            );
+        }
+    });
+}
+
+/// Converts capture chat transfers into the common message view used by the
+/// left list and the packet detail panes.
+fn capture_to_loaded(analysis: &CaptureAnalysis) -> LoadedLogs {
+    let sources = analysis
+        .sources
+        .iter()
+        .map(|source| SourceInfo {
+            path: source.path.clone(),
+            name: source.name.clone(),
+            date: None,
+            bytes: source.bytes,
+            lines: usize::try_from(source.packets).unwrap_or(usize::MAX),
+            fragments: 0,
+        })
+        .collect();
+    let messages = analysis
+        .chat_transfers
+        .iter()
+        .enumerate()
+        .map(|(index, transfer)| {
+            let mut slots: BTreeMap<usize, FragmentSlot> = BTreeMap::new();
+            for occurrence in &transfer.fragments {
+                let slot = slots.entry(occurrence.index).or_default();
+                if slot.payload.is_empty() {
+                    slot.payload = occurrence.payload.clone();
+                }
+                slot.occurrences.push(occurrence.clone());
+            }
+            let first_seen = transfer
+                .fragments
+                .iter()
+                .map(|fragment| fragment.timestamp.clone())
+                .min_by(|left, right| left.text.cmp(&right.text))
+                .unwrap_or_default();
+            let last_seen = transfer
+                .fragments
+                .iter()
+                .map(|fragment| fragment.timestamp.clone())
+                .max_by(|left, right| left.text.cmp(&right.text))
+                .unwrap_or_default();
+            let binary = transfer.binary.clone().or_else(|| {
+                transfer.binary_base64url.as_ref().and_then(|text| {
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(text)
+                        .ok()
+                })
+            });
+            FragmentGroup {
+                message_id: transfer.message_id.clone(),
+                transport_sender: transfer.sender.clone(),
+                total: transfer.fragment_total,
+                slots,
+                first_seen,
+                last_seen,
+                first_order: index,
+                duplicate_count: transfer.duplicate_count,
+                conflicts: transfer.conflicts,
+                warnings: transfer.warnings.clone(),
+                binary,
+                packet: transfer.packet.clone(),
+                status: transfer.status,
+                decryption: transfer.decryption.clone(),
+                signature: transfer.signature.clone(),
+            }
+        })
+        .collect();
+    LoadedLogs {
+        sources,
+        messages,
+        fragment_lines: analysis
+            .chat_transfers
+            .iter()
+            .map(|transfer| transfer.occurrence_count)
+            .sum(),
+        malformed_lines: 0,
+        warnings: analysis.warnings.clone(),
     }
 }
 
@@ -1426,6 +2221,41 @@ fn message_row(
                                 .small()
                                 .color(DecryptionStatus::NoKey.color()),
                         );
+                    }
+                }
+                if let Some(outcome) = &message.signature {
+                    match outcome.status {
+                        SignatureStatus::Verified => {
+                            ui.label(
+                                RichText::new("已验签")
+                                    .small()
+                                    .strong()
+                                    .color(SignatureStatus::Verified.color()),
+                            );
+                        }
+                        SignatureStatus::NoKey => {
+                            ui.label(
+                                RichText::new("签名无公钥")
+                                    .small()
+                                    .color(SignatureStatus::NoKey.color()),
+                            );
+                        }
+                        SignatureStatus::Failed => {
+                            ui.label(
+                                RichText::new("验签失败")
+                                    .small()
+                                    .strong()
+                                    .color(SignatureStatus::Failed.color()),
+                            );
+                        }
+                        SignatureStatus::Unsupported => {
+                            ui.label(
+                                RichText::new("验签不支持")
+                                    .small()
+                                    .color(SignatureStatus::Unsupported.color()),
+                            );
+                        }
+                        SignatureStatus::NotAttempted | SignatureStatus::NotPresent => {}
                     }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1655,11 +2485,7 @@ fn decryption_panel(
                     ui.label(RichText::new("· 已解压").small().color(DIM));
                 }
                 if packet.flag_names.iter().any(|name| name == "SIGNED") {
-                    ui.label(
-                        RichText::new("· 已签名（本工具未验证）")
-                            .small()
-                            .color(MessageStatus::Incomplete.color()),
-                    );
+                    ui.label(RichText::new("· 已签名").small().color(DIM));
                 }
                 if outcome.status == DecryptionStatus::Decrypted {
                     ui.label(
@@ -1752,7 +2578,7 @@ fn decryption_panel(
                 }
                 ui.label(
                     RichText::new(
-                        "AEAD 认证成功；本工具不验证 PQ 签名，也不建立发送者信任或新鲜度。",
+                        "AEAD 认证成功；签名是否有效见下方“验签结果”。解密与验签相互独立。",
                     )
                     .small()
                     .color(DIM),
@@ -1801,6 +2627,125 @@ fn decryption_panel(
                         }
                     });
                 }
+            }
+        });
+}
+
+fn signature_panel(
+    ui: &mut Ui,
+    message: &FragmentGroup,
+    ctx: &egui::Context,
+    open_key_dialog: &mut bool,
+) {
+    let Some(outcome) = &message.signature else {
+        return;
+    };
+    if matches!(
+        outcome.status,
+        SignatureStatus::NotAttempted | SignatureStatus::NotPresent
+    ) {
+        return;
+    }
+    let color = outcome.status.color();
+    Frame::new()
+        .fill(color.gamma_multiply(0.10))
+        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.65)))
+        .corner_radius(6)
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("验签结果").strong().color(color));
+                Frame::new()
+                    .fill(color.gamma_multiply(0.18))
+                    .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.8)))
+                    .corner_radius(9)
+                    .inner_margin(Margin::symmetric(7, 1))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(outcome.status.label())
+                                .small()
+                                .strong()
+                                .color(color),
+                        );
+                    });
+                if let Some(signer) = &outcome.signer {
+                    ui.label(
+                        RichText::new(format!("签名者：{signer}"))
+                            .small()
+                            .color(DIM),
+                    );
+                }
+                if let Some(algorithm) = &outcome.algorithm {
+                    ui.label(
+                        RichText::new(format!("· {algorithm}"))
+                            .small()
+                            .monospace()
+                            .color(DIM),
+                    );
+                }
+                if let Some(owner) = &outcome.key_owner {
+                    ui.label(
+                        RichText::new(format!("· 公钥所有者：{owner}"))
+                            .small()
+                            .color(DIM),
+                    );
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if outcome.status != SignatureStatus::Verified
+                        && ui.small_button("加载公钥…").clicked()
+                    {
+                        *open_key_dialog = true;
+                    }
+                    if outcome.status == SignatureStatus::Verified
+                        && ui.small_button("复制结论").clicked()
+                    {
+                        ctx.copy_text(format!(
+                            "签名有效：{} · {} · 公钥 {}",
+                            outcome.signer.as_deref().unwrap_or("?"),
+                            outcome.algorithm.as_deref().unwrap_or("?"),
+                            outcome.key_owner.as_deref().unwrap_or("?")
+                        ));
+                    }
+                });
+            });
+            if let Some(error) = &outcome.error {
+                ui.label(RichText::new(error).small().color(color));
+            }
+            if let Some(source) = &outcome.key_source {
+                ui.label(
+                    RichText::new(format!("公钥来源：{source}"))
+                        .small()
+                        .color(DIM),
+                )
+                .on_hover_text(source);
+            }
+            if !outcome.attempts.is_empty() {
+                egui::CollapsingHeader::new(format!("已尝试的公钥 ({})", outcome.attempts.len()))
+                    .id_salt(("signature_attempts", &message.message_id))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        for attempt in &outcome.attempts {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · {}{}",
+                                    attempt.key_owner,
+                                    attempt.algorithm,
+                                    if attempt.success { " · 成功" } else { "" }
+                                ))
+                                .small()
+                                .color(if attempt.success {
+                                    SignatureStatus::Verified.color()
+                                } else {
+                                    DIM
+                                }),
+                            )
+                            .on_hover_text(format!(
+                                "{}\n{}",
+                                attempt.key_source,
+                                attempt.error.as_deref().unwrap_or("无错误")
+                            ));
+                        }
+                    });
             }
         });
 }
@@ -2440,5 +3385,86 @@ fn install_fonts(ctx: &egui::Context) {
         }
         ctx.set_fonts(fonts);
         return;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::{CaptureSource, CaptureSummary, ChatTransfer};
+    use crate::model::{FragmentOccurrence, LogTimestamp, SignatureOutcome};
+
+    #[test]
+    fn capture_chat_transfers_map_to_gui_messages() {
+        let fragment = FragmentOccurrence {
+            source_path: "capture.pcapng".to_owned(),
+            source_name: "连接 0 C2S".to_owned(),
+            line: 7,
+            timestamp: LogTimestamp {
+                text: "2026-10-24 12:00:00".to_owned(),
+                date: Some("2026-10-24".to_owned()),
+                time: "12:00:00".to_owned(),
+            },
+            index: 0,
+            total: 1,
+            payload: "AA".to_owned(),
+            payload_length: 1,
+        };
+        let analysis = CaptureAnalysis {
+            tool: "test",
+            version: "test",
+            format_version: 1,
+            generated_at_utc: String::new(),
+            generated_at_local: String::new(),
+            minecraft_version: "26.3".to_owned(),
+            protocol_version: 777,
+            cryptographic_verification: true,
+            payload_decrypted: false,
+            summary: CaptureSummary::default(),
+            sources: vec![CaptureSource {
+                path: "/tmp/capture.pcapng".to_owned(),
+                name: "capture.pcapng".to_owned(),
+                conversations: 1,
+                minecraft_connections: 1,
+                packets: 10,
+                payload_bytes: 100,
+                bytes: 200,
+            }],
+            connections: Vec::new(),
+            chat_transfers: vec![ChatTransfer {
+                message_id: "id".to_owned(),
+                sender: "alice".to_owned(),
+                status: MessageStatus::Parsed,
+                fragment_total: 1,
+                unique_fragments: 1,
+                occurrence_count: 1,
+                duplicate_count: 0,
+                conflicts: 0,
+                missing_indices: Vec::new(),
+                warnings: Vec::new(),
+                binary_length: Some(2),
+                binary_base64url: Some("AAA".to_owned()),
+                packet: None,
+                decryption: None,
+                signature: Some(SignatureOutcome::default()),
+                binary: Some(vec![1, 2, 3]),
+                fragments: vec![fragment],
+            }],
+            public_key_shares: Vec::new(),
+            api_streams: Vec::new(),
+            events: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let loaded = capture_to_loaded(&analysis);
+        assert_eq!(loaded.sources.len(), 1);
+        assert_eq!(loaded.sources[0].lines, 10);
+        assert_eq!(loaded.fragment_lines, 1);
+        assert_eq!(loaded.messages.len(), 1);
+        let message = &loaded.messages[0];
+        assert_eq!(message.binary.as_deref(), Some([1, 2, 3].as_slice()));
+        assert_eq!(message.unique_fragments(), 1);
+        assert_eq!(message.slots[&0].payload, "AA");
+        assert!(message.signature.is_some());
     }
 }
