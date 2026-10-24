@@ -268,9 +268,41 @@ impl MessageStatus {
     }
 }
 
+/// Which source produced a message row in the shared left-hand list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MessageKind {
+    /// Chat fragments reassembled from logs or `krypt04mcg:chat_fragment`.
+    #[default]
+    Chat,
+    /// A `krypt04mcg_stream:control` stream control message.
+    Control,
+    /// A reassembled `krypt04mcg:public_key` identity share.
+    PublicKey,
+    /// One direction of an API stream carried by `krypt04mcg_stream:data/*`.
+    ApiStream,
+}
+
+impl MessageKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "聊天",
+            Self::Control => "控制",
+            Self::PublicKey => "公钥共享",
+            Self::ApiStream => "API 流",
+        }
+    }
+
+    pub fn is_chat(self) -> bool {
+        self == Self::Chat
+    }
+}
+
 /// A reassembled Krypt04Mcg message, including incomplete groups.
 #[derive(Clone, Debug)]
 pub struct FragmentGroup {
+    /// Chat for log/capture chat fragments; other variants are synthesized by
+    /// the capture UI for control, key-share and API-stream rows.
+    pub kind: MessageKind,
     pub message_id: String,
     pub transport_sender: String,
     pub total: usize,

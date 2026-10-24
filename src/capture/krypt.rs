@@ -15,9 +15,13 @@ use uuid::Uuid;
 use crate::decrypt::{KeyStore, StreamKeyDirection, StreamRecordCipher};
 use crate::fragment::{GroupAccumulator, parse_fragment_text};
 use crate::model::{
-    DecryptionOutcome, DecryptionStatus, FragmentOccurrence, SignatureOutcome, SignatureStatus,
+    DataField, DecryptionOutcome, DecryptionStatus, FragmentOccurrence, SignatureOutcome,
+    SignatureStatus,
 };
-use crate::packet::hex_preview;
+use crate::packet::{
+    CAT_CIPHERTEXT, CAT_HEADER, CAT_MESSAGE_ID, CAT_RAW, CAT_SENDER, CAT_SESSION, CAT_SIGNATURE,
+    hex, hex_preview,
+};
 
 use super::mc::{ParsedConnection, RawChannelMessage};
 use super::{
@@ -437,6 +441,10 @@ impl<'a> Analyzer<'a> {
         };
         let kind = control_kind_name(wire.kind.0);
         let stream_uuid = wire.id;
+        let (event_sender, event_receiver) = match message.side {
+            Side::ClientToServer => (local_sender(&runtime.local), wire.peer.clone()),
+            Side::ServerToClient => (wire.peer.clone(), local_sender(&runtime.local)),
+        };
         let mut event = ChannelEvent {
             index: 0,
             time: message.time.clone(),
@@ -447,6 +455,8 @@ impl<'a> Analyzer<'a> {
             payload: ChannelPayload::Control {
                 kind: kind.to_owned(),
                 peer: wire.peer.clone(),
+                sender: event_sender,
+                receiver: event_receiver,
                 stream_id: stream_uuid.to_string(),
                 slot: wire.slot,
                 business_channel: wire.channel.clone(),
@@ -455,6 +465,8 @@ impl<'a> Analyzer<'a> {
                 body_length: wire.body.0.len(),
                 hmac: None,
                 exchange: None,
+                fields: Vec::new(),
+                binary: message.data.clone(),
             },
             error: None,
         };
@@ -483,6 +495,7 @@ impl<'a> Analyzer<'a> {
                     binary: wire.body.0.clone(),
                 }));
             }
+            fill_control_fields(&mut event, &message.data, &wire, kind);
             return Some(event);
         }
 
@@ -600,6 +613,7 @@ impl<'a> Analyzer<'a> {
             }
             self.streams.end(stream_uuid, kind, &message.time);
         }
+        fill_control_fields(&mut event, &message.data, &wire, kind);
         Some(event)
     }
 
@@ -1696,6 +1710,304 @@ fn control_kind_name(kind: i32) -> &'static str {
     }
 }
 
+/// Number of bytes used by the Minecraft VarInt encoding of `value`.
+fn varint_len(value: i32) -> usize {
+    let mut value = value as u32;
+    let mut length = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        length += 1;
+    }
+    length
+}
+
+struct ControlOffsets {
+    kind: (usize, usize),
+    peer: (usize, usize),
+    stream_id: (usize, usize),
+    slot: (usize, usize),
+    channel: (usize, usize),
+    session_id: (usize, usize),
+    sequence: (usize, usize),
+    body_length: (usize, usize),
+    body_data: (usize, usize),
+}
+
+/// Reproduces the control-wire layout so the GUI can map every field back to
+/// exact bytes of the original payload.
+fn control_offsets(wire: &ControlWire) -> ControlOffsets {
+    let mut pos = 0;
+    let kind_len = varint_len(wire.kind.0);
+    let kind = (pos, kind_len);
+    pos += kind_len;
+
+    let peer_prefix = varint_len(wire.peer.len() as i32);
+    let peer = (pos, peer_prefix + wire.peer.len());
+    pos += peer.1;
+
+    let stream_id = (pos, 16);
+    pos += 16;
+
+    let slot = (pos, 4);
+    pos += 4;
+
+    let channel_prefix = varint_len(wire.channel.len() as i32);
+    let channel = (pos, channel_prefix + wire.channel.len());
+    pos += channel.1;
+
+    let session_prefix = varint_len(wire.session_id.len() as i32);
+    let session_id = (pos, session_prefix + wire.session_id.len());
+    pos += session_id.1;
+
+    let sequence = (pos, 8);
+    pos += 8;
+
+    let body_prefix = varint_len(wire.body.0.len() as i32);
+    let body_length = (pos, body_prefix);
+    pos += body_prefix;
+    let body_data = (pos, wire.body.0.len());
+    ControlOffsets {
+        kind,
+        peer,
+        stream_id,
+        slot,
+        channel,
+        session_id,
+        sequence,
+        body_length,
+        body_data,
+    }
+}
+
+fn hex_range(data: &[u8], (offset, length): (usize, usize)) -> Option<String> {
+    data.get(offset..offset.checked_add(length)?).map(hex)
+}
+
+fn shifted_fields(fields: &[DataField], delta: usize, prefix: &str) -> Vec<DataField> {
+    fields
+        .iter()
+        .map(|field| {
+            let mut clone = field.clone();
+            clone.name = format!("{prefix}{}", field.name);
+            clone.offset = field.offset.saturating_add(delta);
+            clone.children = shifted_fields(&field.children, delta, prefix);
+            clone
+        })
+        .collect()
+}
+
+fn text_field(
+    name: &str,
+    label: &str,
+    (offset, length): (usize, usize),
+    data: &[u8],
+    value: String,
+    note: &str,
+    category: u8,
+) -> DataField {
+    DataField {
+        name: name.to_owned(),
+        label: label.to_owned(),
+        offset,
+        length,
+        value,
+        hex: hex_range(data, (offset, length)),
+        note: Some(note.to_owned()),
+        category,
+        children: Vec::new(),
+    }
+}
+
+fn fill_control_fields(event: &mut ChannelEvent, data: &[u8], wire: &ControlWire, kind: &str) {
+    let (exchange_fields, hmac) = match &event.payload {
+        ChannelPayload::Control { exchange, hmac, .. } => (
+            exchange
+                .as_ref()
+                .map(|exchange| exchange.packet.fields.as_slice()),
+            hmac.as_ref(),
+        ),
+        _ => (None, None),
+    };
+    let fields = control_fields(data, wire, kind, exchange_fields, hmac);
+    if let ChannelPayload::Control { fields: slot, .. } = &mut event.payload {
+        *slot = fields;
+    }
+}
+
+fn control_fields(
+    data: &[u8],
+    wire: &ControlWire,
+    kind: &str,
+    exchange_fields: Option<&[DataField]>,
+    hmac: Option<&ControlHmac>,
+) -> Vec<DataField> {
+    let offsets = control_offsets(wire);
+    let mut fields = vec![
+        text_field(
+            "control.kind",
+            "控制类型",
+            offsets.kind,
+            data,
+            format!("{kind} ({})", wire.kind.0),
+            "VarInt 枚举：0 EXCHANGE / 1 OPEN / 2 ASSIGNED / 3 READY / 4 END / 5 RESET / 6 ABORT",
+            CAT_HEADER,
+        ),
+        text_field(
+            "control.peer",
+            "对端玩家",
+            offsets.peer,
+            data,
+            wire.peer.clone(),
+            "VarInt 字节长度 + UTF-8，上限 16 字符",
+            CAT_SENDER,
+        ),
+        text_field(
+            "control.stream_id",
+            "流 ID",
+            offsets.stream_id,
+            data,
+            wire.id.to_string(),
+            "UUID（16 字节，按大端两个 u64 编码）",
+            CAT_MESSAGE_ID,
+        ),
+        text_field(
+            "control.slot",
+            "槽位",
+            offsets.slot,
+            data,
+            wire.slot.to_string(),
+            "i32 大端；-1 表示尚未分配",
+            CAT_HEADER,
+        ),
+        text_field(
+            "control.business_channel",
+            "业务通道",
+            offsets.channel,
+            data,
+            if wire.channel.is_empty() {
+                "(空)".to_owned()
+            } else {
+                wire.channel.clone()
+            },
+            "VarInt 字节长度 + UTF-8，上限 256 字符",
+            CAT_SESSION,
+        ),
+        text_field(
+            "control.session_id",
+            "会话 ID",
+            offsets.session_id,
+            data,
+            if wire.session_id.is_empty() {
+                "(空)".to_owned()
+            } else {
+                wire.session_id.clone()
+            },
+            "VarInt 字节长度 + UTF-8，上限 64 字符",
+            CAT_SESSION,
+        ),
+        text_field(
+            "control.sequence",
+            "序列号",
+            offsets.sequence,
+            data,
+            wire.sequence.to_string(),
+            "i64 大端；重放域内的控制/记录序号",
+            CAT_HEADER,
+        ),
+    ];
+
+    let inner_fields = exchange_fields
+        .map(|fields| shifted_fields(fields, offsets.body_data.0, "control.body.inner."))
+        .unwrap_or_default();
+    let (body_label, body_note) = if exchange_fields.is_some() {
+        (
+            "控制体（内部 Krypt04Mcg 包）",
+            "内部包字段的偏移已换算到完整控制负载；解包结果见上方",
+        )
+    } else if wire.body.0.len() == 32 {
+        ("控制体（HMAC-SHA256）", "32 字节 HMAC 认证标签")
+    } else {
+        ("控制体", "长度前缀 + 原始字节")
+    };
+    let body_bytes = DataField {
+        name: "control.body.bytes".to_owned(),
+        label: "控制体字节".to_owned(),
+        offset: offsets.body_data.0,
+        length: offsets.body_data.1,
+        value: format!("{} 字节", offsets.body_data.1),
+        hex: exchange_fields
+            .is_none()
+            .then(|| hex_range(data, offsets.body_data))
+            .flatten(),
+        note: (exchange_fields.is_some()).then(|| "内部数据包字节".to_owned()),
+        category: if exchange_fields.is_some() {
+            CAT_RAW
+        } else {
+            CAT_CIPHERTEXT
+        },
+        children: inner_fields,
+    };
+    fields.push(DataField {
+        name: "control.body".to_owned(),
+        label: body_label.to_owned(),
+        offset: offsets.body_length.0,
+        length: offsets.body_length.1 + offsets.body_data.1,
+        value: format!("{} 字节", offsets.body_data.1),
+        hex: hex_range(data, offsets.body_length),
+        note: Some(body_note.to_owned()),
+        category: if exchange_fields.is_some() {
+            CAT_RAW
+        } else {
+            CAT_CIPHERTEXT
+        },
+        children: vec![
+            DataField {
+                name: "control.body.length".to_owned(),
+                label: "控制体长度前缀".to_owned(),
+                offset: offsets.body_length.0,
+                length: offsets.body_length.1,
+                value: offsets.body_data.1.to_string(),
+                hex: hex_range(data, offsets.body_length),
+                note: Some("VarInt 字节长度".to_owned()),
+                category: CAT_CIPHERTEXT,
+                children: Vec::new(),
+            },
+            body_bytes,
+        ],
+    });
+
+    if let Some(hmac) = hmac {
+        let value = if hmac.verified {
+            "HMAC 校验通过".to_owned()
+        } else if let Some(error) = &hmac.error {
+            format!("HMAC 未通过：{error}")
+        } else {
+            "HMAC 未通过".to_owned()
+        };
+        fields.push(DataField {
+            name: "control.hmac".to_owned(),
+            label: "HMAC-SHA256".to_owned(),
+            offset: offsets.body_data.0,
+            length: offsets.body_data.1,
+            value,
+            hex: hex_range(data, offsets.body_data),
+            note: Some(format!(
+                "{} -> {}{}",
+                hmac.source,
+                hmac.target,
+                hmac.error
+                    .as_ref()
+                    .map(|error| format!("\n{error}"))
+                    .unwrap_or_default()
+            )),
+            category: CAT_SIGNATURE,
+            children: Vec::new(),
+        });
+    }
+
+    fields
+}
+
 #[derive(mc_protocol::Packet)]
 struct TunnelWire {
     peer: String,
@@ -1951,8 +2263,10 @@ impl KeyShareAssembler {
                 None
             };
             let mut warnings = entry.warnings;
+            let mut binary = Vec::new();
             let (json, identity) = match assembled {
                 Some(text) if text.len() <= MAX_KEY_SHARE_BYTES => {
+                    binary = text.as_bytes().to_vec();
                     match serde_json::from_str::<serde_json::Value>(&text) {
                         Ok(value) => {
                             let identity = identity_summary(&value);
@@ -1994,6 +2308,7 @@ impl KeyShareAssembler {
                 json,
                 warnings,
                 observations: entry.observations,
+                binary,
             });
         }
         shares.sort_by_key(|share| {

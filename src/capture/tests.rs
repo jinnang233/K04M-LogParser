@@ -150,6 +150,9 @@ fn analyzes_synthetic_capture_channels() {
             .map(|identity| identity.owner.as_str()),
         Some(ALICE)
     );
+    assert!(!share.binary.is_empty());
+    let share_json: serde_json::Value = serde_json::from_slice(&share.binary).unwrap();
+    assert_eq!(share_json["owner"], ALICE);
 
     // Legacy tunnel framing and decryption use the separate tunnel KDF.
     let tunnel = analysis
@@ -208,10 +211,44 @@ fn analyzes_synthetic_capture_channels() {
         .find(|event| matches!(&event.payload, super::ChannelPayload::Control { kind, .. } if kind == "OPEN"))
         .expect("OPEN control event");
     if let super::ChannelPayload::Control {
-        hmac: Some(hmac), ..
+        hmac: Some(hmac),
+        fields,
+        binary,
+        ..
     } = &open.payload
     {
         assert!(hmac.verified, "{hmac:?}");
+        assert_eq!(binary, &open_control());
+        let kind = fields
+            .iter()
+            .find(|field| field.name == "control.kind")
+            .expect("control kind field");
+        assert_eq!((kind.offset, kind.length), (0, 1));
+        let peer = fields
+            .iter()
+            .find(|field| field.name == "control.peer")
+            .expect("control peer field");
+        assert_eq!(peer.offset, 1);
+        assert_eq!(peer.value, BOB);
+        assert_eq!(binary[peer.offset] as usize, BOB.len());
+        assert_eq!(
+            &binary[peer.offset + 1..peer.offset + peer.length],
+            BOB.as_bytes()
+        );
+        let body = fields
+            .iter()
+            .find(|field| field.name == "control.body")
+            .expect("control body field");
+        assert!(
+            body.children
+                .iter()
+                .any(|field| field.name == "control.body.bytes")
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.name == "control.hmac" && field.value.contains("通过"))
+        );
     } else {
         panic!("OPEN control without HMAC result");
     }

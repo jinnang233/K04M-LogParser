@@ -31,7 +31,7 @@ use serde::Serialize;
 
 use crate::decrypt::KeyStore;
 use crate::model::{
-    DecryptionOutcome, FragmentOccurrence, MessageStatus, ParsedPacket, SignatureOutcome,
+    DataField, DecryptionOutcome, FragmentOccurrence, MessageStatus, ParsedPacket, SignatureOutcome,
 };
 
 pub use krypt::CaptureAnalysis;
@@ -208,6 +208,9 @@ pub enum ChannelPayload {
     Control {
         kind: String,
         peer: String,
+        /// Sender/receiver inferred from the capture connection direction.
+        sender: String,
+        receiver: String,
         stream_id: String,
         slot: i32,
         business_channel: String,
@@ -218,6 +221,12 @@ pub enum ChannelPayload {
         hmac: Option<ControlHmac>,
         #[serde(skip_serializing_if = "Option::is_none")]
         exchange: Option<Box<ControlExchange>>,
+        /// Field tree mapped onto the raw control payload.
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        fields: Vec<DataField>,
+        /// Raw control payload bytes for the GUI hex viewer. Never serialized.
+        #[serde(skip)]
+        binary: Vec<u8>,
     },
     Tunnel {
         peer: String,
@@ -348,6 +357,9 @@ pub struct PublicKeyShare {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
     pub observations: Vec<ChannelObservation>,
+    /// Reassembled identity JSON bytes for the GUI hex viewer. Never serialized.
+    #[serde(skip)]
+    pub binary: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize)]

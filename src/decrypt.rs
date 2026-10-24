@@ -372,6 +372,7 @@ impl KeyStore {
             MessageStatus::Invalid
         };
         let group = FragmentGroup {
+            kind: crate::model::MessageKind::Chat,
             message_id: packet.message_id_hex.clone(),
             transport_sender: packet.sender.clone(),
             total: 1,

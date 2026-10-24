@@ -12,7 +12,7 @@ use k04m_log_parser::decrypt::KeyStore;
 use k04m_log_parser::export::to_json_string;
 use k04m_log_parser::log_reader::load_paths;
 use k04m_log_parser::model::{
-    FragmentGroup, LogTimestamp, MessageStatus, SignatureOutcome, SignatureStatus,
+    FragmentGroup, LogTimestamp, MessageKind, MessageStatus, SignatureOutcome, SignatureStatus,
 };
 use k04m_log_parser::packet::parse_packet;
 
@@ -38,6 +38,7 @@ fn group_from_base64(packet_base64: &str) -> (FragmentGroup, Vec<u8>) {
         packet.error
     );
     let group = FragmentGroup {
+        kind: MessageKind::Chat,
         message_id: packet.message_id_hex.clone(),
         transport_sender: packet.sender.clone(),
         total: 1,

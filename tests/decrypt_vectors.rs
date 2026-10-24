@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use base64::Engine as _;
 use k04m_log_parser::decrypt::KeyStore;
-use k04m_log_parser::model::{FragmentGroup, LogTimestamp, MessageStatus};
+use k04m_log_parser::model::{FragmentGroup, LogTimestamp, MessageKind, MessageStatus};
 use k04m_log_parser::packet::parse_packet;
 
 fn vector_document() -> serde_json::Value {
@@ -36,6 +36,7 @@ fn message_from_base64(packet_base64: &str) -> FragmentGroup {
         packet.error
     );
     FragmentGroup {
+        kind: MessageKind::Chat,
         message_id: packet.message_id_hex.clone(),
         transport_sender: packet.sender.clone(),
         total: 1,
@@ -228,6 +229,7 @@ fn decrypts_kmcg_encrypted_account_storage() {
 fn incomplete_messages_are_not_attempted() {
     let store = KeyStore::default();
     let message = FragmentGroup {
+        kind: MessageKind::Chat,
         message_id: "0".repeat(32),
         transport_sender: "tester".to_owned(),
         total: 2,

@@ -4,7 +4,9 @@ use std::collections::HashMap;
 
 use base64::Engine as _;
 
-use crate::model::{FragmentGroup, FragmentOccurrence, FragmentSlot, LogTimestamp, MessageStatus};
+use crate::model::{
+    FragmentGroup, FragmentOccurrence, FragmentSlot, LogTimestamp, MessageKind, MessageStatus,
+};
 use crate::packet::{MAX_PACKET_BYTES, parse_packet};
 
 pub const PREFIX: &str = "[KRYPT04MCG]";
@@ -256,6 +258,7 @@ impl GroupBuilder {
             && (0..self.total).all(|index| self.slots.contains_key(&index));
 
         let mut group = FragmentGroup {
+            kind: MessageKind::Chat,
             message_id: self.message_id,
             transport_sender: self.transport_sender,
             total: self.total,

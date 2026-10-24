@@ -6,24 +6,31 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine as _;
-use chrono::Local;
+use chrono::{Local, NaiveDateTime};
 use eframe::egui::{
     self, Align, Color32, FontData, FontDefinitions, FontFamily, FontId, Frame, Label, Layout,
     Margin, RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2,
 };
 
 use crate::capture::{
-    CaptureAnalysis, CaptureOptions, ChannelPayload, analyze_captures, export_capture_json,
+    ApiStream, ApiStreamDirection, CaptureAnalysis, CaptureOptions, ChannelEvent, ChannelPayload,
+    ChatTransfer, PublicKeyShare, analyze_captures, export_capture_json,
 };
 use crate::decrypt::{KeyLoadSummary, KeyStore};
 use crate::export::export_json;
 use crate::log_reader::{discover_inputs, load_paths};
 use crate::model::{
     DataField, DecryptionOutcome, DecryptionStatus, FragmentGroup, FragmentSlot, LoadedLogs,
-    MessageStatus, ParsedPacket, SignatureStatus, SourceInfo,
+    MessageKind, MessageStatus, ParsedPacket, SignatureStatus, SourceInfo,
 };
 use crate::packet::{
     FlatField, byte_categories, flatten_fields, hex, hex_preview, packet_type_chinese,
+};
+
+/// The GUI keeps decrypted stream bytes so API-stream rows can show their
+/// fields and full binary. The CLI defaults to not retaining them.
+const GUI_CAPTURE_OPTIONS: CaptureOptions = CaptureOptions {
+    retain_stream_data: true,
 };
 
 const ACCENT: Color32 = Color32::from_rgb(88, 166, 255);
@@ -267,19 +274,27 @@ impl K04MApp {
     }
 
     fn load_captures(&mut self, paths: Vec<PathBuf>) {
-        match analyze_captures(&paths, &self.key_store, &CaptureOptions::default()) {
+        match analyze_captures(&paths, &self.key_store, &GUI_CAPTURE_OPTIONS) {
             Ok(analysis) => {
                 let data = capture_to_loaded(&analysis);
                 let summary = analysis.summary.clone();
+                let control_count = analysis
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event.payload, ChannelPayload::Control { .. }))
+                    .count();
                 self.status_error = false;
                 self.status = format!(
-                    "已解析 {} 个抓包、{} 个 TCP 会话、{} 个 Minecraft 连接；聊天消息 {} 条（已解密 {}、已验签 {}）",
+                    "已解析 {} 个抓包、{} 个 TCP 会话、{} 个 Minecraft 连接；聊天 {} 条（已解密 {}、已验签 {}）· 控制 {} 条 · 公钥共享 {} 条 · API 流 {} 条",
                     summary.capture_files,
                     summary.conversations,
                     summary.minecraft_connections,
                     summary.chat_transfers,
                     summary.chat_transfers_decrypted,
-                    summary.signatures_verified
+                    summary.signatures_verified,
+                    control_count,
+                    summary.public_key_shares,
+                    summary.api_streams
                 );
                 self.selected_message = (!data.messages.is_empty()).then_some(0);
                 self.selected_field = None;
@@ -308,11 +323,7 @@ impl K04MApp {
         if inputs.captures.is_empty() {
             return;
         }
-        match analyze_captures(
-            &inputs.captures,
-            &self.key_store,
-            &CaptureOptions::default(),
-        ) {
+        match analyze_captures(&inputs.captures, &self.key_store, &GUI_CAPTURE_OPTIONS) {
             Ok(analysis) => {
                 let data = capture_to_loaded(&analysis);
                 let selected = self
@@ -530,8 +541,13 @@ impl K04MApp {
                     packet.sender.to_lowercase().contains(&query)
                         || packet.receiver.to_lowercase().contains(&query)
                         || packet.packet_type_name.to_lowercase().contains(&query)
+                        || packet.message_id_hex.to_lowercase().contains(&query)
                         || packet.algorithms.kem.to_lowercase().contains(&query)
                         || packet.algorithms.aead.to_lowercase().contains(&query)
+                        || packet
+                            .session_id
+                            .as_deref()
+                            .is_some_and(|value| value.to_lowercase().contains(&query))
                         || packet
                             .timestamp_utc
                             .as_deref()
@@ -544,6 +560,7 @@ impl K04MApp {
                     .is_some_and(|text| text.to_lowercase().contains(&query));
                 message.message_id.contains(&query)
                     || message.transport_sender.to_lowercase().contains(&query)
+                    || message.kind.label().to_lowercase().contains(&query)
                     || message.first_seen.text.to_lowercase().contains(&query)
                     || packet_hit
                     || plaintext_hit
@@ -884,7 +901,7 @@ impl K04MApp {
                             ui.label(RichText::new("没有找到 Krypt04Mcg 消息").color(DIM));
                             ui.label(
                                 RichText::new(if self.capture.is_some() {
-                                    "抓包中需要包含 krypt04mcg:chat_fragment 通道"
+                                    "抓包中需要包含 krypt04mcg:chat_fragment、public_key 或 stream:control/data 通道"
                                 } else {
                                     "日志中需要包含 [KRYPT04MCG] 分片行"
                                 })
@@ -1007,26 +1024,28 @@ impl K04MApp {
                 ui.add_space(4.0);
             }
 
-            let fragment_label = format!(
-                "分片与来源 · {}/{} 唯一分片 · {} 次出现{}",
-                message.unique_fragments(),
-                message.total,
-                message.occurrences(),
-                if message.duplicate_count > 0 {
-                    format!(" · {} 次重复", message.duplicate_count)
-                } else {
-                    String::new()
+            if message.kind.is_chat() {
+                let fragment_label = format!(
+                    "分片与来源 · {}/{} 唯一分片 · {} 次出现{}",
+                    message.unique_fragments(),
+                    message.total,
+                    message.occurrences(),
+                    if message.duplicate_count > 0 {
+                        format!(" · {} 次重复", message.duplicate_count)
+                    } else {
+                        String::new()
+                    }
+                );
+                egui::CollapsingHeader::new(fragment_label)
+                    .id_salt(("fragments", message_index))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        show_fragments = true;
+                        fragments_table(ui, message);
+                    });
+                if show_fragments {
+                    ui.add_space(4.0);
                 }
-            );
-            egui::CollapsingHeader::new(fragment_label)
-                .id_salt(("fragments", message_index))
-                .default_open(false)
-                .show(ui, |ui| {
-                    show_fragments = true;
-                    fragments_table(ui, message);
-                });
-            if show_fragments {
-                ui.add_space(4.0);
             }
 
             let available = ui.available_size();
@@ -1194,7 +1213,7 @@ impl K04MApp {
                     for line in [
                         "1. 打开 latest.log、包含多个 .log / .log.gz 的 logs 文件夹，或 .pcap / .pcapng 抓包。",
                         "2. 日志支持乱序分片、重复分片和跨文件合并；抓包会自动重组 TCP 与 Krypt04Mcg 通道。",
-                        "3. 左侧选择消息，右侧查看二进制与全部包字段；抓包模式还可打开“抓包详情”。",
+                        "3. 左侧选择消息（抓包中还有控制、公钥共享和 API 流），右侧查看字段与二进制；抓包模式还可打开“抓包详情”。",
                         "4. 点击字段，二进制中对应字节会以黄色高亮；悬停字段可临时预览。",
                         "5. 加载私钥、会话密钥与签名公钥（Ctrl+K），解密正文并验证包签名。",
                         "6. “导出 JSON” 会导出全部结果：日志为消息/字段/明文，抓包为连接/事件/流/公钥共享。",
@@ -1966,7 +1985,7 @@ fn capture_events(ui: &mut Ui, analysis: &CaptureAnalysis) {
     .show(ui, |ui| {
         ui.label(
             RichText::new(format!(
-                "共 {} 个通道事件；聊天分片已显示在主消息列表，这里列出其余 {} 个（最多 3000 个）。",
+                "共 {} 个通道事件；解析后的聊天、流控制、公钥共享和 API 流已进入主消息列表，这里按原始通道事件列出其余 {} 个（最多 3000 个）。",
                 analysis.events.len(),
                 other_events.len()
             ))
@@ -2044,8 +2063,9 @@ fn capture_events(ui: &mut Ui, analysis: &CaptureAnalysis) {
     });
 }
 
-/// Converts capture chat transfers into the common message view used by the
-/// left list and the packet detail panes.
+/// Converts every capture entity into the common message view used by the
+/// left list and the packet detail panes: chat transfers, stream control
+/// messages, public-key shares and API stream directions.
 fn capture_to_loaded(analysis: &CaptureAnalysis) -> LoadedLogs {
     let sources = analysis
         .sources
@@ -2059,57 +2079,66 @@ fn capture_to_loaded(analysis: &CaptureAnalysis) -> LoadedLogs {
             fragments: 0,
         })
         .collect();
-    let messages = analysis
-        .chat_transfers
-        .iter()
+
+    let mut rows: Vec<(i64, usize, FragmentGroup)> = Vec::new();
+    let mut order = 0usize;
+    for transfer in &analysis.chat_transfers {
+        let millis = transfer
+            .fragments
+            .iter()
+            .filter_map(|fragment| log_timestamp_millis(&fragment.timestamp.text))
+            .min()
+            .unwrap_or(i64::MAX);
+        rows.push((millis, order, chat_transfer_to_message(transfer)));
+        order += 1;
+    }
+    for event in &analysis.events {
+        if matches!(event.payload, ChannelPayload::Control { .. }) {
+            rows.push((
+                event.time.epoch_millis,
+                order,
+                control_event_to_message(event),
+            ));
+            order += 1;
+        }
+    }
+    for share in &analysis.public_key_shares {
+        let millis = share
+            .observations
+            .first()
+            .map_or(i64::MAX, |observation| observation.time.epoch_millis);
+        rows.push((millis, order, key_share_to_message(share)));
+        order += 1;
+    }
+    for stream in &analysis.api_streams {
+        let millis = stream
+            .first_seen
+            .as_ref()
+            .map_or(i64::MAX, |time| time.epoch_millis);
+        if stream.directions.is_empty() {
+            rows.push((millis, order, api_stream_to_message(stream, None)));
+            order += 1;
+        } else {
+            for direction in &stream.directions {
+                rows.push((
+                    millis,
+                    order,
+                    api_stream_to_message(stream, Some(direction)),
+                ));
+                order += 1;
+            }
+        }
+    }
+    rows.sort_by_key(|(millis, order, _)| (*millis, *order));
+    let messages = rows
+        .into_iter()
         .enumerate()
-        .map(|(index, transfer)| {
-            let mut slots: BTreeMap<usize, FragmentSlot> = BTreeMap::new();
-            for occurrence in &transfer.fragments {
-                let slot = slots.entry(occurrence.index).or_default();
-                if slot.payload.is_empty() {
-                    slot.payload = occurrence.payload.clone();
-                }
-                slot.occurrences.push(occurrence.clone());
-            }
-            let first_seen = transfer
-                .fragments
-                .iter()
-                .map(|fragment| fragment.timestamp.clone())
-                .min_by(|left, right| left.text.cmp(&right.text))
-                .unwrap_or_default();
-            let last_seen = transfer
-                .fragments
-                .iter()
-                .map(|fragment| fragment.timestamp.clone())
-                .max_by(|left, right| left.text.cmp(&right.text))
-                .unwrap_or_default();
-            let binary = transfer.binary.clone().or_else(|| {
-                transfer.binary_base64url.as_ref().and_then(|text| {
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .decode(text)
-                        .ok()
-                })
-            });
-            FragmentGroup {
-                message_id: transfer.message_id.clone(),
-                transport_sender: transfer.sender.clone(),
-                total: transfer.fragment_total,
-                slots,
-                first_seen,
-                last_seen,
-                first_order: index,
-                duplicate_count: transfer.duplicate_count,
-                conflicts: transfer.conflicts,
-                warnings: transfer.warnings.clone(),
-                binary,
-                packet: transfer.packet.clone(),
-                status: transfer.status,
-                decryption: transfer.decryption.clone(),
-                signature: transfer.signature.clone(),
-            }
+        .map(|(index, (_, _, mut message))| {
+            message.first_order = index;
+            message
         })
         .collect();
+
     LoadedLogs {
         sources,
         messages,
@@ -2121,6 +2150,964 @@ fn capture_to_loaded(analysis: &CaptureAnalysis) -> LoadedLogs {
         malformed_lines: 0,
         warnings: analysis.warnings.clone(),
     }
+}
+
+fn log_timestamp_millis(text: &str) -> Option<i64> {
+    if text.is_empty() {
+        return None;
+    }
+    for format in [
+        "%Y-%m-%d %H:%M:%S%.3f",
+        "%Y-%m-%d %H:%M:%S%.6f",
+        "%Y-%m-%d %H:%M:%S%.9f",
+        "%Y-%m-%d %H:%M:%S",
+    ] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(text, format) {
+            return naive
+                .and_local_timezone(Local)
+                .earliest()
+                .map(|value| value.timestamp_millis());
+        }
+    }
+    None
+}
+
+fn chat_transfer_to_message(transfer: &ChatTransfer) -> FragmentGroup {
+    let mut slots: BTreeMap<usize, FragmentSlot> = BTreeMap::new();
+    for occurrence in &transfer.fragments {
+        let slot = slots.entry(occurrence.index).or_default();
+        if slot.payload.is_empty() {
+            slot.payload = occurrence.payload.clone();
+        }
+        slot.occurrences.push(occurrence.clone());
+    }
+    let first_seen = transfer
+        .fragments
+        .iter()
+        .map(|fragment| fragment.timestamp.clone())
+        .min_by(|left, right| left.text.cmp(&right.text))
+        .unwrap_or_default();
+    let last_seen = transfer
+        .fragments
+        .iter()
+        .map(|fragment| fragment.timestamp.clone())
+        .max_by(|left, right| left.text.cmp(&right.text))
+        .unwrap_or_default();
+    let binary = transfer.binary.clone().or_else(|| {
+        transfer.binary_base64url.as_ref().and_then(|text| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(text)
+                .ok()
+        })
+    });
+    FragmentGroup {
+        kind: MessageKind::Chat,
+        message_id: transfer.message_id.clone(),
+        transport_sender: transfer.sender.clone(),
+        total: transfer.fragment_total,
+        slots,
+        first_seen,
+        last_seen,
+        first_order: 0,
+        duplicate_count: transfer.duplicate_count,
+        conflicts: transfer.conflicts,
+        warnings: transfer.warnings.clone(),
+        binary,
+        packet: transfer.packet.clone(),
+        status: transfer.status,
+        decryption: transfer.decryption.clone(),
+        signature: transfer.signature.clone(),
+    }
+}
+
+fn control_event_to_message(event: &ChannelEvent) -> FragmentGroup {
+    let ChannelPayload::Control {
+        kind,
+        peer,
+        sender,
+        receiver,
+        stream_id,
+        slot: _,
+        business_channel: _,
+        session_id,
+        sequence,
+        body_length: _,
+        hmac,
+        exchange,
+        fields,
+        binary,
+    } = &event.payload
+    else {
+        unreachable!("control_event_to_message requires a control event");
+    };
+
+    let inner = exchange.as_ref().map(|exchange| &exchange.packet);
+    let (packet_sender, packet_receiver) = match inner {
+        Some(packet) => (packet.sender.clone(), packet.receiver.clone()),
+        None => (sender.clone(), receiver.clone()),
+    };
+
+    let mut warnings = Vec::new();
+    if let Some(error) = &event.error {
+        warnings.push(error.clone());
+    }
+    if let Some(hmac) = hmac {
+        if hmac.verified {
+            // Successful HMAC is shown in the fields panel; not a warning.
+        } else if let Some(error) = &hmac.error {
+            warnings.push(format!("HMAC：{error}"));
+        } else {
+            warnings.push("HMAC-SHA256 校验未通过".to_owned());
+        }
+    }
+    if let Some(inner) = inner {
+        for warning in &inner.warnings {
+            if !warnings.contains(warning) {
+                warnings.push(warning.clone());
+            }
+        }
+    }
+
+    let hmac_mismatch = hmac
+        .as_ref()
+        .is_some_and(|hmac| !hmac.verified && hmac.error.is_none());
+    let hmac_missing_key = hmac.as_ref().is_some_and(|hmac| {
+        hmac.error
+            .as_deref()
+            .is_some_and(|error| error.contains("没有 sessionId"))
+    });
+    let status = if event.error.is_some()
+        || inner.is_some_and(|packet| packet.error.is_some())
+        || hmac_mismatch
+    {
+        MessageStatus::Invalid
+    } else if hmac_missing_key {
+        MessageStatus::Incomplete
+    } else {
+        MessageStatus::Parsed
+    };
+
+    // Start from the inner packet when this is an EXCHANGE so algorithms and
+    // type information remain visible; otherwise synthesize a control packet.
+    let mut packet = inner.cloned().unwrap_or_default();
+    packet.packet_type_name = match inner {
+        Some(inner) if !inner.packet_type_name.is_empty() => {
+            format!("{kind} · {}", inner.packet_type_name)
+        }
+        _ => kind.clone(),
+    };
+    packet.sender = packet_sender.clone();
+    packet.receiver = packet_receiver.clone();
+    packet.timestamp_millis = Some(event.time.epoch_millis);
+    packet.timestamp_utc = Some(event.time.utc.clone());
+    packet.timestamp_local = Some(event.time.local.clone());
+    if packet.message_id_hex.is_empty() {
+        packet.message_id_hex = stream_id.clone();
+    }
+    if packet.session_id.is_none() && !session_id.is_empty() {
+        packet.session_id = Some(session_id.clone());
+    }
+    if packet.sequence.is_none() {
+        packet.sequence = Some(*sequence);
+    }
+    packet.fields = fields.clone();
+    packet.consumed = binary.len();
+    packet.trailing = 0;
+    packet.error = inner.and_then(|packet| packet.error.clone());
+    packet.error_offset = inner.and_then(|packet| packet.error_offset);
+
+    let first_seen = event.time.log_timestamp();
+    FragmentGroup {
+        kind: MessageKind::Control,
+        message_id: if stream_id.is_empty() {
+            format!("控制 {kind} · {peer}")
+        } else {
+            stream_id.clone()
+        },
+        transport_sender: packet_sender,
+        total: 1,
+        slots: BTreeMap::new(),
+        first_seen: first_seen.clone(),
+        last_seen: first_seen,
+        first_order: 0,
+        duplicate_count: 0,
+        conflicts: 0,
+        warnings,
+        binary: Some(binary.clone()),
+        packet: Some(packet),
+        status,
+        decryption: exchange
+            .as_ref()
+            .map(|exchange| exchange.decryption.clone()),
+        signature: exchange.as_ref().map(|exchange| exchange.signature.clone()),
+    }
+}
+
+fn key_share_to_message(share: &PublicKeyShare) -> FragmentGroup {
+    let first_time = share
+        .observations
+        .first()
+        .map(|observation| observation.time.log_timestamp())
+        .unwrap_or_default();
+    let status = if !share.complete {
+        MessageStatus::Incomplete
+    } else if share.json.is_some() {
+        MessageStatus::Parsed
+    } else {
+        MessageStatus::Invalid
+    };
+    let sender = share.sender.clone();
+    let receiver = share
+        .receiver
+        .clone()
+        .unwrap_or_else(|| "(未知)".to_owned());
+    let binary = share.binary.clone();
+
+    let mut fields = vec![
+        meta_field(
+            "keyshare.transfer_id",
+            "传输 ID",
+            share.transfer_id.clone(),
+            "公钥分片传输 UUID",
+        ),
+        meta_field(
+            "keyshare.sender",
+            "发送者",
+            share.sender.clone(),
+            "分片发送者",
+        ),
+        meta_field(
+            "keyshare.receiver",
+            "接收者",
+            share
+                .receiver
+                .clone()
+                .unwrap_or_else(|| "(未知)".to_owned()),
+            "分片接收者",
+        ),
+        meta_field(
+            "keyshare.version",
+            "通道版本",
+            share.version.to_string(),
+            "krypt04mcg:public_key 版本",
+        ),
+        meta_field(
+            "keyshare.chunks",
+            "分片",
+            format!("{}/{}", share.received_chunks, share.total_chunks),
+            if share.complete {
+                "所有分片均已收到"
+            } else {
+                "存在缺失分片，无法重组身份 JSON"
+            },
+        ),
+    ];
+
+    if let Some(identity) = &share.identity {
+        let mut identity_fields = Vec::new();
+        identity_fields.push(value_field(
+            "keyshare.identity.owner",
+            "所有者",
+            &binary,
+            &identity.owner,
+            "身份 JSON 中的 owner",
+        ));
+        identity_fields.push(value_field(
+            "keyshare.identity.uuid",
+            "UUID",
+            &binary,
+            &identity.uuid,
+            "身份 JSON 中的 uuid",
+        ));
+        if let Some(kem) = &identity.kem_public_key {
+            identity_fields.extend(public_key_record_fields(
+                "keyshare.identity.kem",
+                "KEM 公钥",
+                &binary,
+                kem,
+                share
+                    .json
+                    .as_ref()
+                    .and_then(|json| json.get("kemPublicKey")),
+            ));
+        }
+        if let Some(signature) = &identity.signature_public_key {
+            identity_fields.extend(public_key_record_fields(
+                "keyshare.identity.signature",
+                "签名公钥",
+                &binary,
+                signature,
+                share
+                    .json
+                    .as_ref()
+                    .and_then(|json| json.get("signaturePublicKey")),
+            ));
+        }
+        fields.push(DataField {
+            name: "keyshare.identity".to_owned(),
+            label: "身份摘要".to_owned(),
+            offset: 0,
+            length: binary.len(),
+            value: format!("owner={} · uuid={}", identity.owner, identity.uuid),
+            hex: None,
+            note: Some("从身份 JSON 中提取的字段；标有偏移的子字段可在二进制中高亮".to_owned()),
+            category: 5,
+            children: identity_fields,
+        });
+    }
+
+    if !binary.is_empty() {
+        fields.push(DataField {
+            name: "keyshare.json".to_owned(),
+            label: "身份 JSON".to_owned(),
+            offset: 0,
+            length: binary.len(),
+            value: format!(
+                "{} 字节{}",
+                binary.len(),
+                if share.json.is_some() {
+                    " · 有效 JSON"
+                } else {
+                    " · JSON 解析失败"
+                }
+            ),
+            hex: None,
+            note: Some("完整重组后的 public_key 分片文本".to_owned()),
+            category: 5,
+            children: Vec::new(),
+        });
+    }
+
+    let mut chunk_fields = Vec::new();
+    for (position, observation) in share.observations.iter().enumerate() {
+        chunk_fields.push(meta_field(
+            &format!("keyshare.observation.{position}"),
+            &format!("分片 #{}", observation.chunk_index),
+            format!(
+                "连接 {} · {} · {}",
+                observation.connection,
+                observation.side.label(),
+                observation.time.local
+            ),
+            "该分片在抓包中的观测位置",
+        ));
+    }
+    if !chunk_fields.is_empty() {
+        fields.push(DataField {
+            name: "keyshare.observations".to_owned(),
+            label: "分片观测".to_owned(),
+            offset: 0,
+            length: 0,
+            value: format!("{} 次", share.observations.len()),
+            hex: None,
+            note: None,
+            category: 11,
+            children: chunk_fields,
+        });
+    }
+
+    let mut packet = ParsedPacket {
+        packet_type_name: "public_key".to_owned(),
+        sender: sender.clone(),
+        receiver: receiver.clone(),
+        timestamp_millis: share
+            .observations
+            .first()
+            .map(|observation| observation.time.epoch_millis),
+        timestamp_utc: share
+            .observations
+            .first()
+            .map(|observation| observation.time.utc.clone()),
+        timestamp_local: share
+            .observations
+            .first()
+            .map(|observation| observation.time.local.clone()),
+        message_id_hex: share.transfer_id.clone(),
+        consumed: binary.len(),
+        fields,
+        ..Default::default()
+    };
+    packet.trailing = 0;
+
+    FragmentGroup {
+        kind: MessageKind::PublicKey,
+        message_id: share.transfer_id.clone(),
+        transport_sender: sender,
+        total: 1,
+        slots: BTreeMap::new(),
+        first_seen: first_time.clone(),
+        last_seen: first_time,
+        first_order: 0,
+        duplicate_count: 0,
+        conflicts: if share.complete {
+            0
+        } else {
+            share.total_chunks.saturating_sub(share.received_chunks)
+        },
+        warnings: share.warnings.clone(),
+        binary: (!binary.is_empty()).then_some(binary),
+        packet: Some(packet),
+        status,
+        decryption: None,
+        signature: None,
+    }
+}
+
+fn public_key_record_fields(
+    prefix: &str,
+    label: &str,
+    binary: &[u8],
+    record: &crate::capture::PublicKeyRecordSummary,
+    json_record: Option<&serde_json::Value>,
+) -> Vec<DataField> {
+    let mut fields = vec![
+        value_field(
+            &format!("{prefix}.algorithm"),
+            &format!("{label}算法"),
+            binary,
+            &record.algorithm,
+            "algorithm",
+        ),
+        value_field(
+            &format!("{prefix}.uuid"),
+            &format!("{label} UUID"),
+            binary,
+            &record.uuid,
+            "uuid",
+        ),
+        value_field(
+            &format!("{prefix}.fingerprint"),
+            &format!("{label}指纹"),
+            binary,
+            &record.fingerprint,
+            "fingerprint",
+        ),
+        record.created_at.as_deref().map_or_else(
+            || DataField {
+                name: format!("{prefix}.created_at"),
+                label: format!("{label}创建时间"),
+                offset: 0,
+                length: 0,
+                value: "-".to_owned(),
+                hex: None,
+                note: Some("JSON 中没有 createdAt".to_owned()),
+                category: 5,
+                children: Vec::new(),
+            },
+            |created_at| {
+                value_field(
+                    &format!("{prefix}.created_at"),
+                    &format!("{label}创建时间"),
+                    binary,
+                    created_at,
+                    "createdAt",
+                )
+            },
+        ),
+    ];
+    if let Some(json_record) = json_record {
+        if let Some(owner) = json_record.get("owner").and_then(serde_json::Value::as_str) {
+            fields.push(value_field(
+                &format!("{prefix}.owner"),
+                &format!("{label}所有者"),
+                binary,
+                owner,
+                "owner",
+            ));
+        }
+        if let Some(key_data) = json_record
+            .get("keyData")
+            .and_then(serde_json::Value::as_str)
+        {
+            let (offset, length) = find_bytes(binary, key_data.as_bytes()).unwrap_or((0, 0));
+            fields.push(DataField {
+                name: format!("{prefix}.key_data"),
+                label: format!("{label} keyData"),
+                offset,
+                length,
+                value: format!("{} 字符", key_data.chars().count()),
+                hex: None,
+                note: Some(format!(
+                    "公钥编码文本（base64url）：{}{}",
+                    truncate(key_data, 64),
+                    if length == 0 {
+                        "\n未能在 JSON 文本中定位"
+                    } else {
+                        ""
+                    }
+                )),
+                category: 6,
+                children: Vec::new(),
+            });
+        }
+    }
+    fields
+}
+
+fn api_stream_to_message(
+    stream: &ApiStream,
+    direction: Option<&ApiStreamDirection>,
+) -> FragmentGroup {
+    let first_time = stream
+        .first_seen
+        .as_ref()
+        .or(stream.last_seen.as_ref())
+        .map(|time| time.log_timestamp())
+        .unwrap_or_default();
+    let sender = direction.map_or_else(|| stream.initiator.clone(), |d| d.sender.clone());
+    let receiver = direction.map_or_else(|| stream.responder.clone(), |d| d.receiver.clone());
+    let data = direction.map_or(&[][..], |direction| direction.data.as_slice());
+
+    let mut warnings = stream.warnings.clone();
+    if let Some(direction) = direction {
+        warnings.extend(direction.warnings.iter().cloned());
+    }
+    let status = match direction {
+        None => {
+            warnings.push("该流没有捕获到数据记录；可能未捕获数据通道或槽位未绑定".to_owned());
+            MessageStatus::Incomplete
+        }
+        Some(direction) if direction.record_count == 0 => {
+            warnings.push("该方向没有数据记录".to_owned());
+            MessageStatus::Incomplete
+        }
+        Some(direction) if direction.decrypted_records == direction.record_count => {
+            MessageStatus::Parsed
+        }
+        Some(direction) if direction.decrypted_records > 0 => MessageStatus::Incomplete,
+        // All records were seen but no session key was available.
+        Some(direction) if direction.failed_records == 0 => MessageStatus::Incomplete,
+        Some(_) => MessageStatus::Invalid,
+    };
+
+    let mut packet = ParsedPacket {
+        packet_type_name: format!("stream · {}", stream.channel),
+        sender: sender.clone(),
+        receiver: receiver.clone(),
+        timestamp_millis: stream.first_seen.as_ref().map(|time| time.epoch_millis),
+        timestamp_utc: stream.first_seen.as_ref().map(|time| time.utc.clone()),
+        timestamp_local: stream.first_seen.as_ref().map(|time| time.local.clone()),
+        message_id_hex: stream.stream_id.clone(),
+        session_id: (!stream.session_id.is_empty()).then(|| stream.session_id.clone()),
+        consumed: data.len(),
+        fields: stream_fields(stream, direction, data),
+        ..Default::default()
+    };
+    packet.trailing = 0;
+
+    FragmentGroup {
+        kind: MessageKind::ApiStream,
+        message_id: match direction {
+            Some(direction) => format!(
+                "{} {}→{}",
+                stream.stream_id, direction.sender, direction.receiver
+            ),
+            None => stream.stream_id.clone(),
+        },
+        transport_sender: sender,
+        total: 1,
+        slots: BTreeMap::new(),
+        first_seen: first_time.clone(),
+        last_seen: stream
+            .last_seen
+            .as_ref()
+            .map(|time| time.log_timestamp())
+            .unwrap_or(first_time),
+        first_order: 0,
+        duplicate_count: 0,
+        conflicts: 0,
+        warnings,
+        binary: (!data.is_empty()).then(|| data.to_vec()),
+        packet: Some(packet),
+        status,
+        decryption: direction.and_then(|direction| stream_decryption(stream, direction, data)),
+        signature: None,
+    }
+}
+
+fn stream_decryption(
+    stream: &ApiStream,
+    direction: &ApiStreamDirection,
+    data: &[u8],
+) -> Option<DecryptionOutcome> {
+    let status = match direction.decryption.as_str() {
+        "decrypted" => DecryptionStatus::Decrypted,
+        "partial" | "failed" => DecryptionStatus::Failed,
+        "no_key" => DecryptionStatus::NoKey,
+        _ => return None,
+    };
+    let plaintext_length = usize::try_from(direction.content.length).unwrap_or(usize::MAX);
+    let mut plaintext = None;
+    let mut json = None;
+    let mut plaintext_hex = None;
+    let mut error = None;
+    if status == DecryptionStatus::Decrypted {
+        if matches!(direction.content.kind.as_str(), "text" | "json")
+            && let Ok(text) = std::str::from_utf8(data)
+        {
+            const MAX_INLINE_TEXT: usize = 64 * 1024;
+            if text.len() <= MAX_INLINE_TEXT {
+                plaintext = Some(text.to_owned());
+            } else {
+                let mut end = MAX_INLINE_TEXT;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                plaintext = Some(format!(
+                    "[明文共 {} 字节，此处仅显示前 {} 字节；完整内容见右侧二进制面板]\n{}",
+                    text.len(),
+                    end,
+                    &text[..end]
+                ));
+            }
+        }
+        if let Some(value) = &direction.content.json
+            && data.len() <= 256 * 1024
+        {
+            json = Some(value.clone());
+        }
+        if plaintext.is_none() && json.is_none() && !data.is_empty() && data.len() <= 4096 {
+            plaintext_hex = Some(hex(data));
+        }
+        if direction.failed_records > 0 {
+            error = Some(format!(
+                "{} 条记录解密失败；以上为成功记录拼接的明文",
+                direction.failed_records
+            ));
+        }
+    } else {
+        error = direction
+            .records
+            .iter()
+            .find_map(|record| record.error.clone())
+            .or_else(|| {
+                Some(format!(
+                    "{} 条流记录无法解密；请加载该会话对应的 sessions/*.json 会话密钥",
+                    direction.record_count
+                ))
+            });
+    }
+
+    Some(DecryptionOutcome {
+        status,
+        key_kind: Some("session_secret".to_owned()),
+        session_id: (!stream.session_id.is_empty()).then(|| stream.session_id.clone()),
+        compressed: false,
+        plaintext_length,
+        plaintext,
+        json,
+        plaintext_hex,
+        error,
+        ..Default::default()
+    })
+}
+
+fn stream_fields(
+    stream: &ApiStream,
+    direction: Option<&ApiStreamDirection>,
+    data: &[u8],
+) -> Vec<DataField> {
+    let mut fields = vec![
+        meta_field(
+            "stream.id",
+            "流 ID",
+            stream.stream_id.clone(),
+            "krypt04mcg_stream 流 UUID",
+        ),
+        meta_field(
+            "stream.channel",
+            "业务通道",
+            stream.channel.clone(),
+            "对端应用选择的业务通道名",
+        ),
+        meta_field(
+            "stream.session_id",
+            "会话 ID",
+            stream.session_id.clone(),
+            "用于派生流密钥的会话",
+        ),
+        meta_field(
+            "stream.initiator",
+            "发起者",
+            stream.initiator.clone(),
+            "OPEN 控制消息中的发起者",
+        ),
+        meta_field(
+            "stream.responder",
+            "响应者",
+            stream.responder.clone(),
+            "OPEN 控制消息中的响应者",
+        ),
+        meta_field(
+            "stream.end_reason",
+            "结束原因",
+            stream
+                .end_reason
+                .clone()
+                .unwrap_or_else(|| "(未看到结束控制)".to_owned()),
+            "END / RESET / ABORT",
+        ),
+    ];
+
+    if let Some(direction) = direction {
+        fields.push(meta_field(
+            "stream.direction.sender",
+            "方向发送者",
+            direction.sender.clone(),
+            "该方向的发送者",
+        ));
+        fields.push(meta_field(
+            "stream.direction.receiver",
+            "方向接收者",
+            direction.receiver.clone(),
+            "该方向的接收者",
+        ));
+        fields.push(meta_field(
+            "stream.direction.records",
+            "记录数",
+            format!(
+                "{} 条（已解密 {} / 失败 {}）",
+                direction.record_count, direction.decrypted_records, direction.failed_records
+            ),
+            format!("密文字节：{}", direction.ciphertext_bytes),
+        ));
+        fields.push(meta_field(
+            "stream.content.kind",
+            "内容类型",
+            direction.content.kind.clone(),
+            "根据业务通道与明文前缀推断",
+        ));
+        fields.push(meta_field(
+            "stream.content.length",
+            "明文长度",
+            format!("{} 字节", direction.content.length),
+            "所有成功解密记录拼接后的长度",
+        ));
+        if let Some(sha256) = &direction.content.sha256 {
+            fields.push(meta_field(
+                "stream.content.sha256",
+                "SHA-256",
+                sha256.clone(),
+                "拼接后明文的 SHA-256",
+            ));
+        }
+        if let Some(file_name) = &direction.content.file_name {
+            fields.push(meta_field(
+                "stream.content.file_name",
+                "文件名",
+                file_name.clone(),
+                "krypt04mcg_file:stream 头部中的文件名",
+            ));
+        }
+        if let Some(size) = direction.content.declared_file_size {
+            fields.push(meta_field(
+                "stream.content.declared_file_size",
+                "声明文件大小",
+                format!("{size} 字节"),
+                "krypt04mcg_file:stream 头部中的 i32 文件大小",
+            ));
+        }
+
+        if direction.content.file_name.is_some() {
+            fields.extend(file_stream_header_fields(data));
+        }
+
+        if direction.content.json.is_some() && !data.is_empty() {
+            fields.push(DataField {
+                name: "stream.content.json".to_owned(),
+                label: "JSON 明文".to_owned(),
+                offset: 0,
+                length: data.len(),
+                value: format!("{} 字节", data.len()),
+                hex: None,
+                note: Some("明文可解析为 JSON；解密面板显示格式化结果".to_owned()),
+                category: 9,
+                children: Vec::new(),
+            });
+        }
+
+        const MAX_RECORD_FIELDS: usize = 200;
+        let mut record_fields = Vec::new();
+        for record in direction.records.iter().take(MAX_RECORD_FIELDS) {
+            let mut note = format!(
+                "连接 {} · {} · {}\n观察 {} 次",
+                record.connection,
+                record.side.label(),
+                record.time.local,
+                record.observations
+            );
+            if let Some(preview) = &record.preview_text {
+                note.push_str(&format!("\n文本预览：{preview}"));
+            } else if let Some(preview) = &record.preview_hex {
+                note.push_str(&format!("\n十六进制预览：{preview}"));
+            }
+            if let Some(error) = &record.error {
+                note.push_str(&format!("\n错误：{error}"));
+            }
+            record_fields.push(meta_field(
+                &format!("stream.record.{}", record.index),
+                &format!("记录 #{}", record.index),
+                format!(
+                    "{} · 密文 {} B · 明文 {} · {}",
+                    record.status,
+                    record.ciphertext_length,
+                    record
+                        .plaintext_length
+                        .map_or_else(|| "-".to_owned(), |length| format!("{length} B")),
+                    record.time.local
+                ),
+                note,
+            ));
+        }
+        if !record_fields.is_empty() {
+            fields.push(DataField {
+                name: "stream.records".to_owned(),
+                label: "流记录".to_owned(),
+                offset: 0,
+                length: 0,
+                value: format!(
+                    "{} 条{}",
+                    direction.records.len(),
+                    if direction.records.len() > MAX_RECORD_FIELDS {
+                        format!("（仅列出前 {MAX_RECORD_FIELDS} 条）")
+                    } else {
+                        String::new()
+                    }
+                ),
+                hex: None,
+                note: Some("每条记录的索引、状态、长度与时间".to_owned()),
+                category: 9,
+                children: record_fields,
+            });
+        }
+    }
+
+    fields
+}
+
+/// Exact byte ranges for the `krypt04mcg_file:stream` name/length header.
+fn file_stream_header_fields(binary: &[u8]) -> Vec<DataField> {
+    if binary.len() < 2 {
+        return Vec::new();
+    }
+    let name_len = u16::from_be_bytes([binary[0], binary[1]]) as usize;
+    if name_len == 0 || name_len > 540 || binary.len() < 2 + name_len + 4 {
+        return Vec::new();
+    }
+    let size_offset = 2 + name_len;
+    let declared = i32::from_be_bytes(
+        binary[size_offset..size_offset + 4]
+            .try_into()
+            .expect("4-byte slice"),
+    );
+    let content_offset = size_offset + 4;
+    let name = String::from_utf8_lossy(&binary[2..size_offset]).into_owned();
+    vec![
+        range_field(
+            "stream.file.name_length",
+            "文件名长度",
+            0,
+            2,
+            name_len.to_string(),
+            "Java writeUTF 的 u16 大端字节长度",
+            9,
+        ),
+        range_field(
+            "stream.file.name",
+            "文件名",
+            2,
+            name_len,
+            name,
+            "Java modified UTF-8",
+            9,
+        ),
+        range_field(
+            "stream.file.declared_size",
+            "声明文件大小",
+            size_offset,
+            4,
+            declared.to_string(),
+            "i32 大端，最大 10 MiB",
+            9,
+        ),
+        range_field(
+            "stream.file.content",
+            "文件内容",
+            content_offset,
+            binary.len().saturating_sub(content_offset),
+            format!("{} 字节", binary.len().saturating_sub(content_offset)),
+            "文件原始字节",
+            9,
+        ),
+    ]
+}
+
+fn meta_field(name: &str, label: &str, value: String, note: impl Into<String>) -> DataField {
+    DataField {
+        name: name.to_owned(),
+        label: label.to_owned(),
+        offset: 0,
+        length: 0,
+        value,
+        hex: None,
+        note: Some(note.into()),
+        category: 11,
+        children: Vec::new(),
+    }
+}
+
+fn range_field(
+    name: &str,
+    label: &str,
+    offset: usize,
+    length: usize,
+    value: String,
+    note: impl Into<String>,
+    category: u8,
+) -> DataField {
+    DataField {
+        name: name.to_owned(),
+        label: label.to_owned(),
+        offset,
+        length,
+        value,
+        hex: None,
+        note: Some(note.into()),
+        category,
+        children: Vec::new(),
+    }
+}
+
+/// Finds `value` in the identity JSON so clicking the field can highlight the
+/// corresponding bytes. JSON escaping can defeat the search; callers then get
+/// a zero-length field instead of a wrong range.
+fn value_field(name: &str, label: &str, binary: &[u8], value: &str, note: &str) -> DataField {
+    let (offset, length) = find_bytes(binary, value.as_bytes()).unwrap_or((0, 0));
+    DataField {
+        name: name.to_owned(),
+        label: label.to_owned(),
+        offset,
+        length,
+        value: value.to_owned(),
+        hex: None,
+        note: Some(if length == 0 {
+            format!("{note}；未能在 JSON 文本中定位")
+        } else {
+            format!("{note}；JSON 文本中的值")
+        }),
+        category: 5,
+        children: Vec::new(),
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<(usize, usize)> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|offset| (offset, needle.len()))
 }
 
 impl eframe::App for K04MApp {
@@ -2205,17 +3192,15 @@ fn message_row(
                     .color(DIM),
                 );
                 ui.label(
-                    RichText::new(
-                        message
-                            .packet
-                            .as_ref()
-                            .map(|packet| {
-                                packet_type_chinese(packet.packet_type.unwrap_or(0)).to_owned()
-                            })
-                            .unwrap_or_else(|| "未得到完整包".to_owned()),
-                    )
-                    .small()
-                    .color(ACCENT),
+                    RichText::new(message.kind.label())
+                        .small()
+                        .strong()
+                        .color(ACCENT),
+                );
+                ui.label(
+                    RichText::new(truncate(&message_type_label(message), 28))
+                        .small()
+                        .color(DIM),
                 );
                 if let Some(outcome) = &message.decryption {
                     if outcome.is_decrypted() {
@@ -2269,16 +3254,19 @@ fn message_row(
                     }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(if message.binary_len() > 0 {
+                    let detail = if message.kind.is_chat() {
+                        if message.binary_len() > 0 {
                             format!("{} B", message.binary_len())
                         } else {
                             format!("{}/{} 分片", message.unique_fragments(), message.total)
-                        })
-                        .small()
-                        .color(DIM),
-                    );
-                    if message.duplicate_count > 0 {
+                        }
+                    } else if message.binary_len() > 0 {
+                        format!("{} B", message.binary_len())
+                    } else {
+                        "无二进制".to_owned()
+                    };
+                    ui.label(RichText::new(detail).small().color(DIM));
+                    if message.duplicate_count > 0 && message.kind.is_chat() {
                         ui.label(
                             RichText::new(format!("重复 {}", message.duplicate_count))
                                 .small()
@@ -2294,6 +3282,18 @@ fn message_row(
         Sense::click(),
     )
     .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn message_type_label(message: &FragmentGroup) -> String {
+    match &message.packet {
+        Some(packet) if message.kind.is_chat() => {
+            let packet_type = packet.packet_type.unwrap_or(0);
+            format!("{} ({packet_type})", packet_type_chinese(packet_type))
+        }
+        Some(packet) => packet.packet_type_name.clone(),
+        None if message.kind.is_chat() => "未得到完整包".to_owned(),
+        None => message.kind.label().to_owned(),
+    }
 }
 
 fn message_header(ui: &mut Ui, message: &FragmentGroup, message_index: usize, ctx: &egui::Context) {
@@ -2324,16 +3324,17 @@ fn message_header(ui: &mut Ui, message: &FragmentGroup, message_index: usize, ct
                     ctx.copy_text(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(binary));
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!(
+                    let detail = if message.kind.is_chat() {
+                        format!(
                             "{}/{} 分片 · {} 次出现",
                             message.unique_fragments(),
                             message.total,
                             message.occurrences()
-                        ))
-                        .small()
-                        .color(DIM),
-                    );
+                        )
+                    } else {
+                        format!("{} · {} 字节", message.kind.label(), message.binary_len())
+                    };
+                    ui.label(RichText::new(detail).small().color(DIM));
                 });
             });
             ui.add_space(4.0);
@@ -2343,11 +3344,7 @@ fn message_header(ui: &mut Ui, message: &FragmentGroup, message_index: usize, ct
                 (
                     packet.sender.as_str(),
                     packet.receiver.as_str(),
-                    format!(
-                        "{} ({})",
-                        packet_type_chinese(packet.packet_type.unwrap_or(0)),
-                        packet.packet_type.unwrap_or(0)
-                    ),
+                    message_type_label(message),
                     packet
                         .flags
                         .map(|flags| format!("0x{flags:02X} {}", packet.flag_names.join(",")))
@@ -2373,7 +3370,11 @@ fn message_header(ui: &mut Ui, message: &FragmentGroup, message_index: usize, ct
                 info_chip(ui, "大小", &size);
                 info_chip(
                     ui,
-                    "日志时间",
+                    if message.kind.is_chat() {
+                        "日志时间"
+                    } else {
+                        "抓包时间"
+                    },
                     if message.first_seen.text.is_empty() {
                         "-"
                     } else {
@@ -2383,52 +3384,79 @@ fn message_header(ui: &mut Ui, message: &FragmentGroup, message_index: usize, ct
             });
 
             if let Some(packet) = &message.packet {
-                ui.add_space(3.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "算法：{} · {} · {} · {}",
-                            packet.algorithms.kem,
-                            packet.algorithms.signature,
-                            packet.algorithms.aead,
-                            packet.algorithms.hkdf
-                        ))
-                        .small()
-                        .monospace()
-                        .color(DIM),
-                    );
-                    ui.separator();
-                    ui.label(
-                        RichText::new(format!(
-                            "nonce {} B · KEM {} B · 密文 {} B · 签名 {} B",
-                            packet.nonce_len,
-                            packet.kem_ciphertext_len,
-                            packet.ciphertext_len,
-                            packet.signature_len
-                        ))
-                        .small()
-                        .color(DIM),
-                    );
-                    if let (Some(session_id), Some(sequence)) =
-                        (&packet.session_id, packet.sequence)
-                    {
-                        ui.separator();
-                        ui.label(
-                            RichText::new(format!("session {session_id} · seq {sequence}"))
+                let show_algorithms = !(packet.algorithms.kem.is_empty()
+                    && packet.algorithms.signature.is_empty()
+                    && packet.algorithms.aead.is_empty()
+                    && packet.algorithms.hkdf.is_empty());
+                let show_lengths = packet.nonce_len > 0
+                    || packet.kem_ciphertext_len > 0
+                    || packet.ciphertext_len > 0
+                    || packet.signature_len > 0;
+                let show_session = packet.session_id.is_some() && packet.sequence.is_some();
+                let show_time = packet.packet_type.is_some() && packet.timestamp_local.is_some();
+                if show_algorithms || show_lengths || show_session || show_time {
+                    ui.add_space(3.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let mut needs_separator = false;
+                        if show_algorithms {
+                            ui.label(
+                                RichText::new(format!(
+                                    "算法：{} · {} · {} · {}",
+                                    packet.algorithms.kem,
+                                    packet.algorithms.signature,
+                                    packet.algorithms.aead,
+                                    packet.algorithms.hkdf
+                                ))
+                                .small()
+                                .monospace()
+                                .color(DIM),
+                            );
+                            needs_separator = true;
+                        }
+                        if show_lengths {
+                            if needs_separator {
+                                ui.separator();
+                            }
+                            ui.label(
+                                RichText::new(format!(
+                                    "nonce {} B · KEM {} B · 密文 {} B · 签名 {} B",
+                                    packet.nonce_len,
+                                    packet.kem_ciphertext_len,
+                                    packet.ciphertext_len,
+                                    packet.signature_len
+                                ))
                                 .small()
                                 .color(DIM),
-                        );
-                    }
-                    if let Some(timestamp) = &packet.timestamp_local {
-                        ui.separator();
-                        ui.label(
-                            RichText::new(format!("包时间 {}", short_packet_time(timestamp)))
-                                .small()
-                                .color(DIM),
-                        )
-                        .on_hover_text(timestamp);
-                    }
-                });
+                            );
+                            needs_separator = true;
+                        }
+                        if show_session
+                            && let (Some(session_id), Some(sequence)) =
+                                (&packet.session_id, packet.sequence)
+                        {
+                            if needs_separator {
+                                ui.separator();
+                            }
+                            ui.label(
+                                RichText::new(format!("session {session_id} · seq {sequence}"))
+                                    .small()
+                                    .color(DIM),
+                            );
+                            needs_separator = true;
+                        }
+                        if show_time && let Some(timestamp) = &packet.timestamp_local {
+                            if needs_separator {
+                                ui.separator();
+                            }
+                            ui.label(
+                                RichText::new(format!("包时间 {}", short_packet_time(timestamp)))
+                                    .small()
+                                    .color(DIM),
+                            )
+                            .on_hover_text(timestamp);
+                        }
+                    });
+                }
             }
             let _ = message_index;
         });
@@ -2443,7 +3471,7 @@ fn decryption_panel(
     let Some(packet) = &message.packet else {
         return;
     };
-    if packet.error.is_some() || message.status != MessageStatus::Parsed {
+    if packet.error.is_some() {
         return;
     }
     let Some(outcome) = &message.decryption else {
@@ -2566,30 +3594,38 @@ fn decryption_panel(
                                 .wrap(),
                             );
                         });
-                } else {
+                } else if let Some(hex_text) = &outcome.plaintext_hex {
                     ui.label(
                         RichText::new("明文不是有效 UTF-8，以下为十六进制：")
                             .small()
                             .color(DIM),
                     );
-                    if let Some(hex_text) = &outcome.plaintext_hex {
-                        ScrollArea::vertical()
-                            .id_salt("decrypted_hex_scroll")
-                            .max_height(200.0)
-                            .show(ui, |ui| {
-                                ui.add(
-                                    Label::new(
-                                        RichText::new(hex_text).small().monospace().color(DIM),
-                                    )
-                                    .wrap(),
-                                );
-                            });
-                    }
+                    ScrollArea::vertical()
+                        .id_salt("decrypted_hex_scroll")
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                Label::new(
+                                    RichText::new(hex_text).small().monospace().color(DIM),
+                                )
+                                .wrap(),
+                            );
+                        });
+                } else if outcome.plaintext_length > 0 {
+                    ui.label(
+                        RichText::new(
+                            "明文为二进制或过大，未在解密面板中内联显示；请查看下方字段与二进制面板。",
+                        )
+                        .small()
+                        .color(DIM),
+                    );
                 }
                 ui.label(
-                    RichText::new(
-                        "AEAD 认证成功；签名是否有效见下方“验签结果”。解密与验签相互独立。",
-                    )
+                    RichText::new(if message.kind == MessageKind::ApiStream {
+                        "流记录已通过 XChaCha20-Poly1305 AEAD 认证；会话密钥只用于解密。"
+                    } else {
+                        "AEAD 认证成功；签名是否有效见下方“验签结果”。解密与验签相互独立。"
+                    })
                     .small()
                     .color(DIM),
                 );
@@ -3050,26 +4086,34 @@ fn hex_panel(
 
     let Some(binary) = binary else {
         ui.add_space(18.0);
-        let text = if message.status == MessageStatus::Invalid {
-            "二进制重组或结构解析失败，没有可显示的完整二进制。"
-        } else {
-            "消息尚未完整重组，没有可显示的二进制。"
+        let text = match message.kind {
+            MessageKind::Chat if message.status == MessageStatus::Invalid => {
+                "二进制重组或结构解析失败，没有可显示的完整二进制。"
+            }
+            MessageKind::Chat => "消息尚未完整重组，没有可显示的二进制。",
+            MessageKind::Control => "该控制消息没有保留原始字节。",
+            MessageKind::PublicKey => "公钥分片尚未完整重组，没有可显示的身份 JSON 二进制。",
+            MessageKind::ApiStream => {
+                "该方向没有可显示的明文数据；可能缺少会话密钥或未捕获数据记录。"
+            }
         };
         ui.label(RichText::new(text).color(message.status.color()));
-        let missing = message.missing_indices();
-        if !missing.is_empty() {
-            ui.label(
-                RichText::new(format!(
-                    "缺失分片：{}",
-                    missing
-                        .iter()
-                        .map(usize::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
-                .small()
-                .color(DIM),
-            );
+        if message.kind.is_chat() {
+            let missing = message.missing_indices();
+            if !missing.is_empty() {
+                ui.label(
+                    RichText::new(format!(
+                        "缺失分片：{}",
+                        missing
+                            .iter()
+                            .map(usize::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                    .small()
+                    .color(DIM),
+                );
+            }
         }
         return;
     };
@@ -3100,7 +4144,14 @@ fn hex_panel(
         .as_ref()
         .map(|packet| packet.fields.as_slice())
         .unwrap_or(&[]);
-    let categories = byte_categories(packet_fields, binary.len());
+    // Building one entry per byte is cheap for packets but not for multi-MB
+    // API streams; skip per-byte field coloring above a sane threshold.
+    const MAX_COLORIZE_BYTES: usize = 1024 * 1024;
+    let categories = if binary.len() <= MAX_COLORIZE_BYTES {
+        byte_categories(packet_fields, binary.len())
+    } else {
+        Vec::new()
+    };
     let selected_range = selected
         .map(SelectedField::range)
         .filter(|range| !range.is_empty());
@@ -3489,6 +4540,259 @@ mod tests {
         assert_eq!(message.unique_fragments(), 1);
         assert_eq!(message.slots[&0].payload, "AA");
         assert!(message.signature.is_some());
+    }
+
+    #[test]
+    fn capture_control_keyshare_and_streams_map_to_gui_messages() {
+        use crate::capture::{
+            ApiStream, ApiStreamDirection, CaptureTime, ChannelEvent, ChannelObservation,
+            ChannelPayload, ControlHmac, PublicIdentitySummary, PublicKeyRecordSummary,
+            PublicKeyShare, Side, StreamContent, StreamRecordInfo,
+        };
+
+        let time = CaptureTime {
+            epoch_millis: 1_000,
+            utc: "2026-10-24 12:00:00.000000000 UTC".to_owned(),
+            local: "2026-10-24 20:00:00.000000000 +08:00".to_owned(),
+            secs: 1,
+            nanos: 0,
+        };
+        let control_binary = vec![1, 3, b'b', b'o', b'b'];
+        let control = ChannelEvent {
+            index: 0,
+            time: time.clone(),
+            connection: 0,
+            side: Side::ClientToServer,
+            channel: "krypt04mcg_stream:control".to_owned(),
+            frame_offset: 0,
+            payload: ChannelPayload::Control {
+                kind: "OPEN".to_owned(),
+                peer: "bob".to_owned(),
+                sender: "alice".to_owned(),
+                receiver: "bob".to_owned(),
+                stream_id: "00112233-4455-6677-8899-aabbccddeeff".to_owned(),
+                slot: 0,
+                business_channel: "example:test".to_owned(),
+                session_id: "session".to_owned(),
+                sequence: 1,
+                body_length: 0,
+                hmac: Some(ControlHmac {
+                    verified: true,
+                    source: "alice".to_owned(),
+                    target: "bob".to_owned(),
+                    error: None,
+                }),
+                exchange: None,
+                fields: vec![DataField {
+                    name: "control.kind".to_owned(),
+                    label: "控制类型".to_owned(),
+                    offset: 0,
+                    length: 1,
+                    value: "OPEN (1)".to_owned(),
+                    hex: Some("01".to_owned()),
+                    note: None,
+                    category: 0,
+                    children: Vec::new(),
+                }],
+                binary: control_binary.clone(),
+            },
+            error: None,
+        };
+
+        let identity_json = serde_json::json!({
+            "owner": "alice",
+            "uuid": "11112222-3333-4444-5555-666677778888",
+        });
+        let identity_bytes = serde_json::to_vec(&identity_json).unwrap();
+        let share = PublicKeyShare {
+            transfer_id: "aaaabbbb-cccc-dddd-eeee-ffff00001111".to_owned(),
+            sender: "alice".to_owned(),
+            receiver: Some("bob".to_owned()),
+            version: 1,
+            total_chunks: 1,
+            received_chunks: 1,
+            complete: true,
+            identity: Some(PublicIdentitySummary {
+                owner: "alice".to_owned(),
+                uuid: "11112222-3333-4444-5555-666677778888".to_owned(),
+                kem_public_key: Some(PublicKeyRecordSummary {
+                    algorithm: "ML-KEM-768+X25519/public".to_owned(),
+                    uuid: "11112222-3333-4444-5555-666677778888".to_owned(),
+                    fingerprint: "00".to_owned(),
+                    created_at: None,
+                }),
+                signature_public_key: None,
+            }),
+            json: Some(identity_json),
+            warnings: Vec::new(),
+            observations: vec![ChannelObservation {
+                connection: 0,
+                side: Side::ServerToClient,
+                time: CaptureTime {
+                    epoch_millis: 2_000,
+                    ..time.clone()
+                },
+                chunk_index: 0,
+            }],
+            binary: identity_bytes.clone(),
+        };
+
+        let direction = ApiStreamDirection {
+            sender: "alice".to_owned(),
+            receiver: "bob".to_owned(),
+            record_count: 1,
+            ciphertext_bytes: 10,
+            decrypted_records: 1,
+            failed_records: 0,
+            decryption: "decrypted".to_owned(),
+            content: StreamContent {
+                kind: "text".to_owned(),
+                length: 5,
+                sha256: None,
+                valid_utf8_prefix: true,
+                file_name: None,
+                declared_file_size: None,
+                text_preview: Some("hello".to_owned()),
+                json: None,
+                base64url: None,
+                preview_truncated: false,
+            },
+            records: vec![StreamRecordInfo {
+                index: 0,
+                connection: 0,
+                side: Side::ClientToServer,
+                time: CaptureTime {
+                    epoch_millis: 3_000,
+                    ..time.clone()
+                },
+                ciphertext_length: 10,
+                plaintext_length: Some(5),
+                status: "decrypted".to_owned(),
+                error: None,
+                observations: 1,
+                preview_text: Some("hello".to_owned()),
+                preview_hex: None,
+            }],
+            warnings: Vec::new(),
+            data: b"hello".to_vec(),
+        };
+        let stream = ApiStream {
+            stream_id: "00112233-4455-6677-8899-aabbccddeeff".to_owned(),
+            channel: "example:test".to_owned(),
+            session_id: "session".to_owned(),
+            initiator: "alice".to_owned(),
+            responder: "bob".to_owned(),
+            first_seen: Some(CaptureTime {
+                epoch_millis: 3_000,
+                ..time.clone()
+            }),
+            last_seen: Some(CaptureTime {
+                epoch_millis: 3_100,
+                ..time.clone()
+            }),
+            end_reason: Some("END".to_owned()),
+            directions: vec![direction],
+            warnings: Vec::new(),
+        };
+
+        let analysis = CaptureAnalysis {
+            tool: "test",
+            version: "test",
+            format_version: 1,
+            generated_at_utc: String::new(),
+            generated_at_local: String::new(),
+            minecraft_version: "26.3".to_owned(),
+            protocol_version: 777,
+            cryptographic_verification: false,
+            payload_decrypted: true,
+            summary: CaptureSummary::default(),
+            sources: Vec::new(),
+            connections: Vec::new(),
+            chat_transfers: Vec::new(),
+            public_key_shares: vec![share],
+            api_streams: vec![stream],
+            events: vec![control],
+            warnings: Vec::new(),
+        };
+
+        let loaded = capture_to_loaded(&analysis);
+        assert_eq!(loaded.messages.len(), 3);
+        assert_eq!(loaded.messages[0].kind, MessageKind::Control);
+        assert_eq!(
+            loaded.messages[0].binary.as_deref(),
+            Some(control_binary.as_slice())
+        );
+        assert_eq!(
+            loaded.messages[0]
+                .packet
+                .as_ref()
+                .unwrap()
+                .fields
+                .first()
+                .map(|field| field.name.as_str()),
+            Some("control.kind")
+        );
+        assert_eq!(loaded.messages[1].kind, MessageKind::PublicKey);
+        assert_eq!(
+            loaded.messages[1].binary.as_deref(),
+            Some(identity_bytes.as_slice())
+        );
+        assert!(
+            loaded.messages[1]
+                .packet
+                .as_ref()
+                .unwrap()
+                .fields
+                .iter()
+                .any(|field| field.name == "keyshare.json")
+        );
+        assert_eq!(loaded.messages[2].kind, MessageKind::ApiStream);
+        assert_eq!(
+            loaded.messages[2].binary.as_deref(),
+            Some(b"hello".as_slice())
+        );
+        assert_eq!(
+            loaded.messages[2]
+                .decryption
+                .as_ref()
+                .map(|outcome| outcome.status),
+            Some(crate::model::DecryptionStatus::Decrypted)
+        );
+        assert!(
+            loaded.messages[2]
+                .packet
+                .as_ref()
+                .unwrap()
+                .packet_type_name
+                .contains("stream")
+        );
+    }
+
+    #[test]
+    fn file_stream_header_fields_map_exact_byte_ranges() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&3u16.to_be_bytes());
+        data.extend_from_slice(b"abc");
+        data.extend_from_slice(&5i32.to_be_bytes());
+        data.extend_from_slice(&[1, 2, 3, 4, 5]);
+        let fields = file_stream_header_fields(&data);
+        let name = fields
+            .iter()
+            .find(|field| field.name == "stream.file.name")
+            .unwrap();
+        assert_eq!((name.offset, name.length), (2, 3));
+        assert_eq!(name.value, "abc");
+        let size = fields
+            .iter()
+            .find(|field| field.name == "stream.file.declared_size")
+            .unwrap();
+        assert_eq!((size.offset, size.length), (5, 4));
+        let content = fields
+            .iter()
+            .find(|field| field.name == "stream.file.content")
+            .unwrap();
+        assert_eq!((content.offset, content.length), (9, 5));
+        assert_eq!(content.offset + content.length, data.len());
     }
 
     #[test]
